@@ -1,0 +1,22 @@
+python main.py \
+    --image_size 224 \
+    --balance_data \
+    --acc_dir "D:/PyCharm/PythonProject1/PDF-main/University of Ottawa Electric Motor Dataset/acc/" \
+    --sound_dir "D:/PyCharm/PythonProject1/PDF-main/University of Ottawa Electric Motor Dataset/sound/" \
+    --temp_dir "D:/PyCharm/PythonProject1/PDF-main/University of Ottawa Electric Motor Dataset/temp/" \
+    --num_classes 10 \
+    --epochs 120 \
+    --batch_size 32 \
+    --save_dir "D:/PyCharm/PythonProject1/PDF-main/saved" \
+    --lr 3e-4 \
+    --device cuda:0 \
+    --num_heads 8 \
+    --num_patches 48 \
+    --projection_dim 192 \
+    --lr_scheduler cosine_warmup \
+    --focal_gamma 2.0 \
+    --label_smoothing 0.1 \
+    --mixup_alpha 0.3 \
+    --early_stopping 20 \
+    --seed 42 \
+    #--use_image_input
