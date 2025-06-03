@@ -445,7 +445,7 @@ def main():
         cv_auc_scores.append(best_auc)
         fold_models.append(fold_model_path)
 
-    mean_f1 = np.mean(cv_scores)
+   mean_f1 = np.mean(cv_scores)
     std_f1 = np.std(cv_scores)
     mean_auc = np.mean(cv_auc_scores)
     std_auc = np.std(cv_auc_scores)
@@ -466,9 +466,18 @@ def main():
         'fold_models': fold_models,
         'args': vars(args)
     }
-    with open(os.path.join(args.save_dir, 'cross_validation_results.json'), 'w') as f:
+    
+    with open(os.path。join(args.save_dir， 'cross_validation_results.json')， 'w') as f:
         json.dump(cv_results, f, indent=4)
+    
+    # Create visualization directory
+    vis_dir = os.path。join(args.save_dir， 'visualizations')
+    os.makedirs(vis_dir, exist_ok=True)
+    
+    # Only create the cross-validation summary visualization
+    plot_cross_validation_summary(cv_results, vis_dir)
 
+    # No need to create training curves or other plots
 if __name__ == "__main__":
     main()
 
