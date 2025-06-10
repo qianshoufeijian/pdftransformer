@@ -29,8 +29,8 @@ def set_seed(seed=42):
 
 def load_modality_data(data_dir, modality_name):
     """Load single modality data"""
-    feature_path = os.path.join(data_dir, f"{modality_name}_features.npy")
-    label_path = os.path.join(data_dir, f"{modality_name}_labels.npy")
+    feature_path = os.path.join(data_dir, f"{modality_name}_features1.npy")
+    label_path = os.path.join(data_dir, f"{modality_name}_labels1.npy")
     return np.load(feature_path, allow_pickle=True), np.load(label_path, allow_pickle=True)
 
 def preprocess_data(acc_dir, sound_dir, temp_dir, is_training=True):
@@ -204,16 +204,16 @@ def enhanced_ensemble_predict(model_paths, acc_data, sound_data, temp_data, devi
 # Main function
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--acc_dir', type=str, default="D:/PyCharm/PythonProject1/PDF-main/University of Ottawa Electric Motor Dataset/acc")
-    parser.add_argument('--sound_dir', type=str, default="D:/PyCharm/PythonProject1/PDF-main/University of Ottawa Electric Motor Dataset/sound")
-    parser.add_argument('--temp_dir', type=str, default="D:/PyCharm/PythonProject1/PDF-main/University of Ottawa Electric Motor Dataset/temp")
+    parser.add_argument('--acc_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/acc")
+    parser.add_argument('--sound_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/sound")
+    parser.add_argument('--temp_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/temp")
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=120)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--num_heads', type=int, default=8)
     parser.add_argument('--num_patches', type=int, default=48)
     parser.add_argument('--projection_dim', type=int, default=192)
-    parser.add_argument('--save_dir', type=str, default=r"D:\PyCharm\PythonProject1\PDF-main\saved")
+    parser.add_argument('--save_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/saved")
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--num_classes', type=int, default=10)
     parser.add_argument('--balance_data', action='store_true', help='Apply data balancing')
