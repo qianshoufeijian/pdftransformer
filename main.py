@@ -9,13 +9,15 @@ from sklearn.utils.class_weight import compute_class_weight
 import argparse
 import os
 import json
-from PDFtransformer import TransformerWithPDF, CustomDataset, EnhancedMixedLoss, get_enhanced_lr_scheduler, balance_dataset, plot_confusion_matrix
+from PDFtransformer import TransformerWithPDF, CustomDataset, EnhancedMixedLoss, get_enhanced_lr_scheduler, \
+    balance_dataset, plot_confusion_matrix
 from torch.cuda.amp import autocast, GradScaler
 from sklearn.model_selection import StratifiedKFold
 import inspect
 import random
 from tqdm import tqdm
-
+from visualization_utils import plot_cross_validation_summary
+from pathlib import Path
 # Set random seed for reproducibility
 def set_seed(seed=42):
     random.seed(seed)
@@ -27,11 +29,16 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark = False
     print(f"Random seed set to {seed}")
 
+
 def load_modality_data(data_dir, modality_name):
-    """Load single modality data"""
-    feature_path = os.path.join(data_dir, f"{modality_name}_features1.npy")
-    label_path = os.path.join(data_dir, f"{modality_name}_labels1.npy")
+    feature_path = Path(data_dir) / f"{modality_name}_features4.npy"
+    label_path = Path(data_dir) / (f"{modality_name}_labels4"
+                                   f".npy")
+    # as_posix() 保证路径是 / 分隔
+    feature_path = feature_path.as_posix()
+    label_path = label_path.as_posix()
     return np.load(feature_path, allow_pickle=True), np.load(label_path, allow_pickle=True)
+
 
 def preprocess_data(acc_dir, sound_dir, temp_dir, is_training=True):
     """Load and preprocess tri-modality data"""
@@ -43,6 +50,7 @@ def preprocess_data(acc_dir, sound_dir, temp_dir, is_training=True):
     assert np.array_equal(acc_labels, sound_labels) and np.array_equal(acc_labels, temp_labels), "Labels mismatch!"
     return acc_features, sound_features, temp_features, acc_labels
 
+
 # Improved training function with mixed precision and dynamic mixup
 def train_with_mixed_precision(model, train_loader, optimizer, criterion, device, epoch, epochs, scheduler=None,
                                mixup_alpha=0.4, grad_clip_value=1.0):
@@ -51,14 +59,15 @@ def train_with_mixed_precision(model, train_loader, optimizer, criterion, device
     all_preds = []
     all_labels = []
 
-    # Create gradient scaler for mixed precision training
-    scaler = GradScaler()
+    # 更新为新API
+    scaler = torch.amp.GradScaler('cuda')
 
     # Progress bar with tqdm
     pbar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{epochs}')
 
     for batch_idx, (acc_data, sound_data, temp_data, labels) in enumerate(pbar):
-        acc_data, sound_data, temp_data, labels = acc_data.to(device), sound_data.to(device), temp_data.to(device), labels.to(device)
+        acc_data, sound_data, temp_data, labels = acc_data.to(device), sound_data.to(device), temp_data.to(
+            device), labels.to(device)
 
         # Adaptive mixup probability - higher in early epochs, lower in later epochs
         mixup_prob = mixup_alpha * (1 - epoch / epochs * 0.7)  # Maintain some mixup even in later epochs
@@ -71,14 +80,19 @@ def train_with_mixed_precision(model, train_loader, optimizer, criterion, device
             mixed_sound = lam * sound_data + (1 - lam) * sound_data[idx]
             mixed_temp = lam * temp_data + (1 - lam) * temp_data[idx]
 
-            with autocast(dtype=torch.float16):
+            # 更新为新API
+            with torch.amp.autocast('cuda', dtype=torch.float16):
                 outputs = model(mixed_acc, mixed_sound, mixed_temp)
-                loss1 = criterion(outputs, labels)
-                loss2 = criterion(outputs, labels[idx])
+                squeezed_labels = labels.squeeze()
+                squeezed_idx_labels = labels[idx].squeeze()
+                loss1 = criterion(outputs, squeezed_labels)
+                loss2 = criterion(outputs, squeezed_idx_labels)
                 loss = lam * loss1 + (1 - lam) * loss2
         else:
-            with autocast(dtype=torch.float16):
+            # 更新为新API
+            with torch.amp.autocast('cuda', dtype=torch.float16):
                 outputs = model(acc_data, sound_data, temp_data)
+                labels = labels.squeeze()
                 loss = criterion(outputs, labels)
 
         optimizer.zero_grad()
@@ -92,8 +106,27 @@ def train_with_mixed_precision(model, train_loader, optimizer, criterion, device
 
         # Collect predictions
         _, preds = torch.max(outputs, 1)
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
+
+        # 确保预测和标签都是整数并且是一维数组
+        batch_preds = preds.detach().cpu().numpy().astype(int)
+        batch_labels = labels.detach().cpu().numpy().astype(int)
+
+        # 确保标签是一维的
+        if batch_labels.ndim > 1:
+            batch_labels = batch_labels.flatten()
+
+        all_preds.extend(batch_preds)
+        all_labels.extend(batch_labels)
+
+        # 调试信息 - 只在第一个epoch的第一批次打印
+        if epoch == 0 and batch_idx == 0:
+            print(f"Debug - outputs shape: {outputs.shape}")
+            print(f"Debug - preds shape: {preds.shape}, dtype: {preds.dtype}")
+            print(f"Debug - labels shape: {labels.shape}, dtype: {labels.dtype}")
+            print(f"Debug - batch_preds shape: {batch_preds.shape if hasattr(batch_preds, 'shape') else 'list'}")
+            print(f"Debug - batch_labels shape: {batch_labels.shape if hasattr(batch_labels, 'shape') else 'list'}")
+            print(f"Debug - unique preds: {np.unique(batch_preds)}")
+            print(f"Debug - unique labels: {np.unique(batch_labels)}")
 
         # Update progress bar
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
@@ -102,9 +135,31 @@ def train_with_mixed_precision(model, train_loader, optimizer, criterion, device
         if scheduler is not None and hasattr(scheduler, 'step_batch'):
             scheduler.step()
 
+    # 确保所有数据类型一致
+    all_preds = np.array(all_preds, dtype=int)
+    all_labels = np.array(all_labels, dtype=int)
+
+    # 确保没有超出范围的预测
+    valid_classes = np.unique(all_labels)
+    mask = np.isin(all_preds, valid_classes)
+
+    if not np.all(mask):
+        # 只在第一个epoch打印警告
+        if epoch == 0:
+            print(f"Warning: Removing {np.sum(~mask)} predictions with unknown classes")
+        all_preds = all_preds[mask]
+        all_labels = all_labels[mask]
+
+    # 只在第一个epoch打印最终统计信息
+    if epoch == 0:
+        print(f"Final train - all_preds shape: {all_preds.shape}, all_labels shape: {all_labels.shape}")
+        print(f"Final train - unique preds: {np.unique(all_preds)}")
+        print(f"Final train - unique labels: {np.unique(all_labels)}")
+
     train_metrics = calculate_metrics(all_labels, all_preds)
     train_metrics['loss'] = running_loss / len(train_loader)
     return train_metrics
+
 
 # Evaluation function
 def evaluate(model, data_loader, criterion, device, num_classes):
@@ -114,31 +169,103 @@ def evaluate(model, data_loader, criterion, device, num_classes):
     all_labels = []
     running_loss = 0.0
 
+    # 使用静态变量来追踪是否已经打印过调试信息
+    if not hasattr(evaluate, "debug_printed"):
+        evaluate.debug_printed = False
+
     with torch.no_grad():
-        for acc_data, sound_data, temp_data, labels in tqdm(data_loader, desc="Evaluating"):
-            acc_data, sound_data, temp_data, labels = acc_data.to(device), sound_data.to(device), temp_data.to(device), labels.to(device)
+        for batch_idx, (acc_data, sound_data, temp_data, labels) in enumerate(tqdm(data_loader, desc="Evaluating")):
+            acc_data, sound_data, temp_data, labels = acc_data.to(device), sound_data.to(device), temp_data.to(
+                device), labels.to(device)
             outputs = model(acc_data, sound_data, temp_data)
+            labels = labels.squeeze()
             loss = criterion(outputs, labels)
             running_loss += loss.item()
 
             probs = F.softmax(outputs, dim=1)
             _, preds = torch.max(outputs, 1)
 
-            all_probs.append(probs.cpu().numpy())
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            # 确保预测和标签都是整数并且是一维数组
+            batch_probs = probs.detach().cpu().numpy()
+            batch_preds = preds.detach().cpu().numpy().astype(int)
+            batch_labels = labels.detach().cpu().numpy().astype(int)
 
+            # 确保标签是一维的
+            if batch_labels.ndim > 1:
+                batch_labels = batch_labels.flatten()
+
+            all_probs.append(batch_probs)
+            all_preds.extend(batch_preds)
+            all_labels.extend(batch_labels)
+
+            # 调试信息 - 只在第一次评估的第一批次打印
+            if not evaluate.debug_printed and batch_idx == 0:
+                print(f"Debug eval - outputs shape: {outputs.shape}")
+                print(f"Debug eval - preds shape: {preds.shape}, dtype: {preds.dtype}")
+                print(f"Debug eval - labels shape: {labels.shape}, dtype: {labels.dtype}")
+                print(f"Debug eval - batch_probs shape: {batch_probs.shape}")
+                print(
+                    f"Debug eval - batch_preds shape: {batch_preds.shape if hasattr(batch_preds, 'shape') else 'list'}")
+                print(
+                    f"Debug eval - batch_labels shape: {batch_labels.shape if hasattr(batch_labels, 'shape') else 'list'}")
+                print(f"Debug eval - unique preds: {np.unique(batch_preds)}")
+                print(f"Debug eval - unique labels: {np.unique(batch_labels)}")
+                evaluate.debug_printed = True
+
+    # 确保所有数据类型一致
     all_probs = np.vstack(all_probs) if all_probs else None
+    all_preds = np.array(all_preds, dtype=int)
+    all_labels = np.array(all_labels, dtype=int)
+
+    # 确保没有超出范围的预测
+    valid_classes = np.unique(all_labels)
+    mask = np.isin(all_preds, valid_classes)
+
+    if not np.all(mask):
+        # 只在第一次运行时打印警告
+        if not hasattr(evaluate, "warning_printed"):
+            print(f"Warning: Removing {np.sum(~mask)} predictions with unknown classes")
+            evaluate.warning_printed = True
+        all_preds = all_preds[mask]
+        all_labels = all_labels[mask]
+        if all_probs is not None:
+            all_probs = all_probs[mask]
+
+    # 只在第一次评估时打印最终统计信息
+    if not hasattr(evaluate, "final_printed"):
+        print(f"Final eval - all_preds shape: {all_preds.shape}, all_labels shape: {all_labels.shape}")
+        print(f"Final eval - unique preds: {np.unique(all_preds)}")
+        print(f"Final eval - unique labels: {np.unique(all_labels)}")
+        evaluate.final_printed = True
+
     metrics = calculate_metrics(all_labels, all_preds, all_probs, num_classes)
     metrics['loss'] = running_loss / len(data_loader)
 
-    cm = confusion_matrix(all_labels, all_preds)
-    metrics['confusion_matrix'] = cm
+    try:
+        cm = confusion_matrix(all_labels, all_preds)
+        metrics['confusion_matrix'] = cm
+    except Exception as e:
+        if not hasattr(evaluate, "cm_error_printed"):
+            print(f"Warning: Could not compute confusion matrix: {e}")
+            evaluate.cm_error_printed = True
+        metrics['confusion_matrix'] = np.zeros((num_classes, num_classes))
 
     return metrics
 
+
 # Calculate metrics function
 def calculate_metrics(true_labels, pred_labels, probs=None, num_classes=None):
+    # 确保标签类型一致（转换为numpy数组）
+    true_labels = np.array(true_labels)
+    pred_labels = np.array(pred_labels)
+
+    # 确保标签是一维的
+    true_labels = true_labels.flatten()
+    pred_labels = pred_labels.flatten()
+
+    # 确保数据类型一致
+    true_labels = true_labels.astype(int)
+    pred_labels = pred_labels.astype(int)
     metrics = {
         'accuracy': accuracy_score(true_labels, pred_labels),
         'precision': precision_score(true_labels, pred_labels, average='weighted', zero_division=0),
@@ -154,6 +281,7 @@ def calculate_metrics(true_labels, pred_labels, probs=None, num_classes=None):
         except Exception:
             metrics['auc'] = None
     return metrics
+
 
 def enhanced_ensemble_predict(model_paths, acc_data, sound_data, temp_data, device, args, temperature=1.5):
     """改进的集成预测，带温度缩放和置信度加权"""
@@ -201,21 +329,26 @@ def enhanced_ensemble_predict(model_paths, acc_data, sound_data, temp_data, devi
 
     return np.argmax(avg_probs, axis=1), avg_probs
 
+
 # Main function
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--acc_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/acc")
-    parser.add_argument('--sound_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/sound")
-    parser.add_argument('--temp_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/temp")
+    parser.add_argument('--acc_dir', type=str,
+                        default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/acc")
+    parser.add_argument('--sound_dir', type=str,
+                        default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/sound")
+    parser.add_argument('--temp_dir', type=str,
+                        default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/temp")
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=120)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--num_heads', type=int, default=8)
     parser.add_argument('--num_patches', type=int, default=48)
     parser.add_argument('--projection_dim', type=int, default=192)
-    parser.add_argument('--save_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/saved")
+    parser.add_argument('--save_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/saved4")
     parser.add_argument('--device', type=str, default='cuda:0')
-    parser.add_argument('--num_classes', type=int, default=10)
+    parser.add_argument('--num_classes', type=int, default=5
+                        )
     parser.add_argument('--balance_data', action='store_true', help='Apply data balancing')
     parser.add_argument('--lr_scheduler', type=str, default='cosine_warmup',
                         choices=['step', 'cosine', 'cosine_warm', 'one_cycle', 'plateau', 'cosine_warmup', 'cyclic'])
@@ -267,7 +400,8 @@ def main():
     all_temp = np.vstack((train_temp, val_temp))
     all_labels = np.concatenate((train_labels.reshape(-1), val_labels.reshape(-1)))
 
-    print(f"Combined data shapes - Acceleration: {all_acc.shape}, Sound: {all_sound.shape}, Temperature: {all_temp.shape}")
+    print(
+        f"Combined data shapes - Acceleration: {all_acc.shape}, Sound: {all_sound.shape}, Temperature: {all_temp.shape}")
     print(f"Original class distribution: {np.bincount(all_labels)}")
 
     # Augmentation strength function
@@ -339,11 +473,11 @@ def main():
             samples_weight = torch.tensor([weight[t] for t in fold_train_labels])
             train_sampler = WeightedRandomSampler(samples_weight, len(samples_weight))
             train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler,
-                                      num_workers=4, pin_memory=True)
+                                      num_workers=0, pin_memory=True)
         else:
             train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                      num_workers=4, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+                                      num_workers=0, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
 
         # Initialize model with improved parameters
         model = TransformerWithPDF(
@@ -415,8 +549,8 @@ def main():
             if 'confusion_matrix' in val_metrics:
                 cm_path = os.path.join(args.save_dir, f"fold_{fold + 1}_cm_epoch_{epoch + 1}.png")
                 plot_confusion_matrix(val_metrics['confusion_matrix'],
-                                    [f"Class {i}" for i in range(args.num_classes)],
-                                    cm_path)
+                                      [f"Class {i}" for i in range(args.num_classes)],
+                                      cm_path)
 
             if combined_score > best_combined:
                 best_combined = combined_score
@@ -438,14 +572,16 @@ def main():
             history_serializable = {}
             for key, value in fold_history.items():
                 history_serializable[key] = [{k: float(v) if isinstance(v, (np.float32, np.float64)) else v
-                                            for k, v in epoch_metrics.items() if k != 'confusion_matrix'} for epoch_metrics in value]
+                                              for k, v in epoch_metrics.items() if k != 'confusion_matrix'} for
+                                             epoch_metrics in value]
             json.dump(history_serializable, f)
 
         cv_scores.append(best_f1)
         cv_auc_scores.append(best_auc)
         fold_models.append(fold_model_path)
 
-   mean_f1 = np.mean(cv_scores)
+
+    mean_f1 = np.mean(cv_scores)
     std_f1 = np.std(cv_scores)
     mean_auc = np.mean(cv_auc_scores)
     std_auc = np.std(cv_auc_scores)
@@ -466,18 +602,19 @@ def main():
         'fold_models': fold_models,
         'args': vars(args)
     }
-    
-    with open(os.path。join(args.save_dir， 'cross_validation_results.json')， 'w') as f:
+
+    with open(os.path.join(args.save_dir, 'cross_validation_results.json'), 'w') as f:
         json.dump(cv_results, f, indent=4)
-    
+
     # Create visualization directory
-    vis_dir = os.path。join(args.save_dir， 'visualizations')
+    vis_dir = os.path.join(args.save_dir, 'visualizations')
     os.makedirs(vis_dir, exist_ok=True)
-    
+
     # Only create the cross-validation summary visualization
     plot_cross_validation_summary(cv_results, vis_dir)
 
     # No need to create training curves or other plots
+
+
 if __name__ == "__main__":
     main()
-
