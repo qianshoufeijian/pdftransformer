@@ -1116,19 +1116,28 @@ class EnhancedMixedLoss(nn.Module):
         self.dynamic_focusing = True
 
     def forward(self, inputs, targets):
-        # Ensure targets are of long type
+        # 确保targets是合适的形状
+        if targets.dim() > 1 and targets.size(1) > 1:
+            # 如果targets是多维的，取argmax将其转换为1D
+            _, targets = torch.max(targets, dim=1)
+
+        # 确保targets是长整型
         targets = targets.long()
 
-        # Apply temperature scaling
+        # 应用温度缩放
         scaled_inputs = inputs / self.temp
 
-        # Get softmax probabilities
+        # 计算标准交叉熵
+        try:
+            ce_loss = F.cross_entropy(scaled_inputs, targets, weight=self.alpha, reduction='none')
+        except RuntimeError:
+            print(f"错误：inputs shape: {inputs.shape}， targets shape: {targets.shape}")
+            # 如果还是有错误，采用简单的交叉熵
+            return F.cross_entropy(inputs, targets.reshape(-1), weight=self.alpha, reduction=self.reduction)
+
+        # 获取softmax概率
         probs = F.softmax(scaled_inputs, dim=1)
         pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
-
-        # Compute standard cross entropy
-        ce_loss = F.cross_entropy(scaled_inputs, targets, weight=self.alpha, reduction='none')
-
         # Apply dynamic focusing based on sample difficulty
         if self.dynamic_focusing:
             # Hard samples get higher gamma
