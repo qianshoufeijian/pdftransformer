@@ -9,7 +9,8 @@ import json
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
 import copy
 
 from PDFtransformer import TransformerWithPDF, CustomDataset, EnhancedMixedLoss, get_enhanced_lr_scheduler
@@ -21,10 +22,7 @@ class AblationTransformerWithPDF(TransformerWithPDF):
                  image_input=False, dropout_rate=0.3,
                  # Ablation parameters
                  disable_cross_attention=False,
-                 disable_residual=False,
-                 disable_dynamic_weights=False,
-                 disable_multi_supervision=False,
-                 fusion_method='transformer',  # 'transformer', 'concat', 'average', 'max', 'attention'
+                 disable_prediction_module=False,
                  use_only_modality=None):  # None, 'acc', 'sound', 'temp'
 
         # Initialize parent class
@@ -35,30 +33,8 @@ class AblationTransformerWithPDF(TransformerWithPDF):
 
         # Save ablation parameters
         self.disable_cross_attention = disable_cross_attention
-        self.disable_residual = disable_residual
-        self.disable_dynamic_weights = disable_dynamic_weights
-        self.disable_multi_supervision = disable_multi_supervision
-        self.fusion_method = fusion_method
+        self.disable_prediction_module = disable_prediction_module
         self.use_only_modality = use_only_modality
-
-        # For simple fusion methods, replace the fusion_layer
-        if fusion_method == 'concat':
-            self.simple_fusion = nn.Sequential(
-                nn.Linear(projection_dim * 3, projection_dim),
-                nn.LayerNorm(projection_dim),
-                nn.GELU()
-            )
-        elif fusion_method in ['average', 'max']:
-            # No parameters needed
-            pass
-        elif fusion_method == 'attention':
-            self.attention_fusion = nn.MultiheadAttention(
-                embed_dim=projection_dim,
-                num_heads=num_heads,
-                dropout=0.1,
-                batch_first=True
-            )
-            self.fusion_norm = nn.LayerNorm(projection_dim)
 
     def forward(self, acc_data, sound_data, temp_data):
         # Single modality mode
@@ -87,21 +63,18 @@ class AblationTransformerWithPDF(TransformerWithPDF):
         sound_original = sound_patches
         temp_original = temp_patches
 
-        # Apply modality-specific transformers with optional residual connections
+        # Apply modality-specific transformers with residual connections
         for layer in self.acc_transformer:
             acc_patches = layer(acc_patches)
-            if not self.disable_residual:
-                acc_patches = acc_patches + 0.1 * acc_original
+            acc_patches = acc_patches + 0.1 * acc_original
 
         for layer in self.sound_transformer:
             sound_patches = layer(sound_patches)
-            if not self.disable_residual:
-                sound_patches = sound_patches + 0.1 * sound_original
+            sound_patches = sound_patches + 0.1 * sound_original
 
         for layer in self.temp_transformer:
             temp_patches = layer(temp_patches)
-            if not self.disable_residual:
-                temp_patches = temp_patches + 0.1 * temp_original
+            temp_patches = temp_patches + 0.1 * temp_original
 
         # Calculate features for weight prediction and classification
         acc_feat = acc_patches.mean(dim=1)
@@ -114,7 +87,7 @@ class AblationTransformerWithPDF(TransformerWithPDF):
         temp_pred = self.temp_classifier(temp_feat)
 
         # Dynamic weight calculation (if enabled)
-        if not self.disable_dynamic_weights:
+        if not self.disable_prediction_module:
             acc_weights = self.acc_prediction_module(acc_feat)
             sound_weights = self.sound_prediction_module(sound_feat)
             temp_weights = self.temp_prediction_module(temp_feat)
@@ -132,43 +105,19 @@ class AblationTransformerWithPDF(TransformerWithPDF):
             sound_weights = torch.ones(batch_size, 1).to(acc_patches.device) / 3
             temp_weights = torch.ones(batch_size, 1).to(acc_patches.device) / 3
 
-        # Apply appropriate fusion method
-        if self.fusion_method == 'transformer':
-            # Use the original transformer fusion layer
-            if self.disable_cross_attention:
-                # When cross-attention is disabled, we modify the fusion layer behavior
-                # by concatenating the features directly
-                fused_features = torch.cat([acc_patches, sound_patches, temp_patches], dim=1)
-                # Apply a simple linear layer to get back to original sequence length
-                seq_len = acc_patches.size(1)
-                fused_features = fused_features[:, :seq_len]
-            else:
-                # Normal operation with cross-attention
-                fused_features = self.fusion_layer(
-                    acc_patches, sound_patches, temp_patches,
-                    acc_weights, sound_weights, temp_weights
-                )
-        elif self.fusion_method == 'concat':
-            # Simple concatenation followed by linear projection
-            acc_mean = acc_patches.mean(dim=1)
-            sound_mean = sound_patches.mean(dim=1)
-            temp_mean = temp_patches.mean(dim=1)
-            concat_features = torch.cat([acc_mean, sound_mean, temp_mean], dim=1)
-            fused_feat = self.simple_fusion(concat_features)
-            # Reshape to match expected output format of fusion_layer
-            fused_features = fused_feat.unsqueeze(1).repeat(1, acc_patches.size(1), 1)
-        elif self.fusion_method == 'average':
-            # Simple averaging
-            fused_features = (acc_patches + sound_patches + temp_patches) / 3
-        elif self.fusion_method == 'max':
-            # Element-wise max
-            fused_features = torch.maximum(torch.maximum(acc_patches, sound_patches), temp_patches)
-        elif self.fusion_method == 'attention':
-            # Self-attention based fusion
-            # Concatenate features, perform self-attention, then reduce
-            concat_feats = torch.cat([acc_patches, sound_patches, temp_patches], dim=1)
-            attn_output, _ = self.attention_fusion(concat_feats, concat_feats, concat_feats)
-            fused_features = self.fusion_norm(attn_output[:, :acc_patches.size(1)])
+        # Apply fusion with or without cross-attention
+        if self.disable_cross_attention:
+            # When cross-attention is disabled, we concatenate the features directly
+            fused_features = torch.cat([acc_patches, sound_patches, temp_patches], dim=1)
+            # Apply a simple linear layer to get back to original sequence length
+            seq_len = acc_patches.size(1)
+            fused_features = fused_features[:, :seq_len]
+        else:
+            # Normal operation with cross-attention
+            fused_features = self.fusion_layer(
+                acc_patches, sound_patches, temp_patches,
+                acc_weights, sound_weights, temp_weights
+            )
 
         # Main transformer processing
         x = fused_features
@@ -189,8 +138,8 @@ class AblationTransformerWithPDF(TransformerWithPDF):
         # Main classification from first token
         main_logits = self.fc_out(x[:, 0])
 
-        if self.disable_multi_supervision or not self.training:
-            # If multi-supervision is disabled or during inference, just use main logits
+        if not self.training:
+            # During inference, just use main logits
             return main_logits
         else:
             # Combine predictions with proper weights during training
@@ -204,8 +153,8 @@ class AblationTransformerWithPDF(TransformerWithPDF):
             return final_logits
 
 
-def run_ablation_experiment(config, args, save_dir='ablation_results'):
-    """Run a single ablation experiment with the given configuration"""
+def run_ablation_experiment_with_cv(config, args, save_dir='ablation_results'):
+    """Run an ablation experiment with 5-fold cross-validation"""
     experiment_name = config['name']
     print(f"\n{'=' * 50}")
     print(f"Running ablation experiment: {experiment_name}")
@@ -236,146 +185,237 @@ def run_ablation_experiment(config, args, save_dir='ablation_results'):
         os.path.join(args.temp_dir, "val")
     )
 
-    # Use a subset of data for faster ablation studies if requested
-    if args.quick_ablation:
-        # Use only 30% of the data for quick testing
-        train_acc, _, train_sound, _, train_temp, _, train_labels, _ = train_test_split(
-            train_acc, train_sound, train_temp, train_labels, test_size=0.7, random_state=args.seed)
+    # Combine datasets for cross-validation
+    all_acc = np.vstack((train_acc, val_acc))
+    all_sound = np.vstack((train_sound, val_sound))
+    all_temp = np.vstack((train_temp, val_temp))
+    all_labels = np.concatenate((train_labels.reshape(-1), val_labels.reshape(-1)))
 
-        val_acc, _, val_sound, _, val_temp, _, val_labels, _ = train_test_split(
-            val_acc, val_sound, val_temp, val_labels, test_size=0.7, random_state=args.seed)
+    print(
+        f"Combined data shapes - Acceleration: {all_acc.shape}, Sound: {all_sound.shape}, Temperature: {all_temp.shape}")
+    print(f"Combined class distribution: {np.bincount(all_labels)}")
 
-    # Create data loaders
-    train_dataset = CustomDataset(
-        train_acc, train_sound, train_temp, train_labels,
-        transform=True,
-        aug_strength=0.5,  # Fixed aug_strength for ablation
-        convert_to_image=args.use_image_input,
-        image_size=(args.image_size, args.image_size)
-    )
+    # Start 5-fold cross-validation
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=args.seed)
+    cv_scores = {'accuracy': [], 'f1': [], 'auc': []}
+    fold_histories = []
+    fold_models = []
 
-    val_dataset = CustomDataset(
-        val_acc, val_sound, val_temp, val_labels,
-        transform=False,
-        scalers=train_dataset.scalers,
-        convert_to_image=args.use_image_input,
-        image_size=(args.image_size, args.image_size)
-    )
+    for fold, (train_idx, val_idx) in enumerate(kf.split(all_acc, all_labels)):
+        print(f"\n========== Fold {fold + 1}/5 ==========")
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                              num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
-                            num_workers=0, pin_memory=True)
+        # Split data for current fold
+        fold_train_acc, fold_val_acc = all_acc[train_idx], all_acc[val_idx]
+        fold_train_sound, fold_val_sound = all_sound[train_idx], all_sound[val_idx]
+        fold_train_temp, fold_val_temp = all_temp[train_idx], all_temp[val_idx]
+        fold_train_labels, fold_val_labels = all_labels[train_idx], all_labels[val_idx]
 
-    # Create model with ablation configuration
-    model = AblationTransformerWithPDF(
-        input_shape=[train_acc.shape[1], train_sound.shape[1], train_temp.shape[1]],
-        num_heads=args.num_heads,
-        num_patches=args.num_patches,
-        projection_dim=args.projection_dim,
-        num_classes=args.num_classes,
-        image_input=args.use_image_input,
-        dropout_rate=args.dropout_rate,
-        # Ablation parameters from config
-        disable_cross_attention=config.get('disable_cross_attention', False),
-        disable_residual=config.get('disable_residual', False),
-        disable_dynamic_weights=config.get('disable_dynamic_weights', False),
-        disable_multi_supervision=config.get('disable_multi_supervision', False),
-        fusion_method=config.get('fusion_method', 'transformer'),
-        use_only_modality=config.get('use_only_modality', None)
-    ).to(device)
+        print(f"Fold {fold + 1} split - Train: {len(fold_train_labels)}, Val: {len(fold_val_labels)}")
 
-    # Count trainable parameters
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model has {num_params:,} trainable parameters")
+        # For no_CustomDataset experiment, disable data augmentation
+        use_augmentation = not config.get('disable_data_augmentation', False)
 
-    # Setup loss and optimizer
-    criterion = EnhancedMixedLoss(
-        alpha=None,  # No class weights for ablation studies to keep things simple
-        gamma=args.focal_gamma,
-        smoothing=args.label_smoothing,
-        temp=args.temp
-    )
-
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-
-    scheduler = get_enhanced_lr_scheduler(optimizer, args, train_loader)
-
-    # Training loop
-    best_f1 = 0.0
-    history = {'train': [], 'val': []}
-
-    for epoch in range(args.ablation_epochs):
-        print(f"\nEpoch {epoch + 1}/{args.ablation_epochs}")
-
-        # Train
-        train_metrics = train_with_mixed_precision(
-            model, train_loader, optimizer, criterion, device,
-            epoch, args.ablation_epochs, scheduler, args.mixup_alpha, args.grad_clip
+        train_dataset = CustomDataset(
+            fold_train_acc, fold_train_sound, fold_train_temp, fold_train_labels,
+            transform=use_augmentation,  # Only use augmentation if not disabled
+            aug_strength=0.5 if use_augmentation else 0.0,  # Set aug_strength to 0 if disabled
+            convert_to_image=args.use_image_input,
+            image_size=(args.image_size, args.image_size)
         )
-        history['train'].append(train_metrics)
 
-        # Validate
-        val_metrics = evaluate(model, val_loader, criterion, device, args.num_classes)
-        history['val'].append(val_metrics)
+        val_dataset = CustomDataset(
+            fold_val_acc, fold_val_sound, fold_val_temp, fold_val_labels,
+            transform=False,
+            scalers=train_dataset.scalers,
+            convert_to_image=args.use_image_input,
+            image_size=(args.image_size, args.image_size)
+        )
 
-        print(f"Train Loss: {train_metrics['loss']:.4f}, F1: {train_metrics['f1']:.4f}")
-        print(f"Val Loss: {val_metrics['loss']:.4f}, F1: {val_metrics['f1']:.4f}")
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=0, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                                num_workers=0, pin_memory=True)
 
-        # Save best model
-        if val_metrics['f1'] > best_f1:
-            best_f1 = val_metrics['f1']
-            torch.save(model.state_dict(), os.path.join(exp_dir, 'best_model.pth'))
-            print(f"New best model saved with F1: {best_f1:.4f}")
+        # Create model with ablation configuration
+        model = AblationTransformerWithPDF(
+            input_shape=[fold_train_acc.shape[1], fold_train_sound.shape[1], fold_train_temp.shape[1]],
+            num_heads=args.num_heads,
+            num_patches=args.num_patches,
+            projection_dim=args.projection_dim,
+            num_classes=args.num_classes,
+            image_input=args.use_image_input,
+            dropout_rate=args.dropout_rate,
+            # Ablation parameters from config
+            disable_cross_attention=config.get('disable_cross_attention', False),
+            disable_prediction_module=config.get('disable_prediction_module', False),
+            use_only_modality=config.get('use_only_modality', None)
+        ).to(device)
 
-        # Update scheduler if needed
-        if scheduler is not None and args.lr_scheduler == 'plateau':
-            scheduler.step(val_metrics['f1'])
-        elif scheduler is not None and not hasattr(scheduler, 'step_batch'):
-            scheduler.step()
+        # Count trainable parameters
+        num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Model has {num_params:,} trainable parameters")
 
-    # Test final model performance
-    model.load_state_dict(torch.load(os.path.join(exp_dir, 'best_model.pth')))
-    final_metrics = evaluate(model, val_loader, criterion, device, args.num_classes)
+        # Setup loss and optimizer
+        criterion = EnhancedMixedLoss(
+            alpha=None,  # No class weights for ablation studies to keep things simple
+            gamma=args.focal_gamma,
+            smoothing=args.label_smoothing,
+            temp=args.temp
+        )
 
-    # Save results
-    results = {
-        'experiment': experiment_name,
-        'configuration': config,
-        'best_f1': best_f1,
-        'final_metrics': {k: float(v) if isinstance(v, (np.float32, np.float64)) else v
-                          for k, v in final_metrics.items() if k != 'confusion_matrix'},
-        'num_parameters': num_params,
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+
+        scheduler = get_enhanced_lr_scheduler(optimizer, args, train_loader)
+
+        # Training loop
+        best_f1 = 0.0
+        best_auc = 0.0
+        best_accuracy = 0.0
+        no_improve_epochs = 0
+        fold_history = {'train': [], 'val': []}
+
+        for epoch in range(args.epochs):
+            print(f"\nFold {fold + 1}, Epoch {epoch + 1}/{args.epochs}")
+
+            # Train
+            train_metrics = train_with_mixed_precision(
+                model, train_loader, optimizer, criterion, device,
+                epoch, args.epochs, scheduler, args.mixup_alpha, args.grad_clip
+            )
+            fold_history['train'].append(train_metrics)
+
+            # Validate
+            val_metrics = evaluate(model, val_loader, criterion, device, args.num_classes)
+
+            # Calculate AUC for multi-class classification (one-vs-rest)
+            val_probs = []
+            val_true = []
+
+            model.eval()
+            with torch.no_grad():
+                for batch in val_loader:
+                    acc_data, sound_data, temp_data, labels = [b.to(device) for b in batch]
+                    outputs = model(acc_data, sound_data, temp_data)
+                    probs = torch.nn.functional.softmax(outputs, dim=1).cpu().numpy()
+                    val_probs.append(probs)
+                    val_true.append(labels.cpu().numpy())
+
+            val_probs = np.vstack(val_probs)
+            val_true = np.concatenate(val_true)
+
+            # Calculate one-vs-rest AUC for each class
+            auc_scores = []
+            for i in range(args.num_classes):
+                if len(np.unique(val_true == i)) > 1:  # Only calculate AUC if both classes present
+                    auc_scores.append(roc_auc_score((val_true == i).astype(int), val_probs[:, i]))
+                else:
+                    auc_scores.append(0.0)
+
+            # Macro AUC (average across classes)
+            val_metrics['auc'] = np.mean(auc_scores)
+
+            fold_history['val'].append(val_metrics)
+
+            print(f"Train Loss: {train_metrics['loss']:.4f}, F1: {train_metrics['f1']:.4f}")
+            print(f"Val Loss: {val_metrics['loss']:.4f}, F1: {val_metrics['f1']:.4f}, AUC: {val_metrics['auc']:.4f}")
+
+            # Update scheduler if needed
+            if scheduler is not None and args.lr_scheduler == 'plateau':
+                scheduler.step(val_metrics['f1'])
+            elif scheduler is not None and not hasattr(scheduler, 'step_batch'):
+                scheduler.step()
+
+            # Save confusion matrix
+            if 'confusion_matrix' in val_metrics:
+                cm_path = os.path.join(exp_dir, f"fold_{fold + 1}_cm_epoch_{epoch + 1}.png")
+                plt.figure(figsize=(10, 8))
+                sns.heatmap(val_metrics['confusion_matrix'], annot=True, fmt='d', cmap='Blues',
+                            xticklabels=[f"C{i}" for i in range(args.num_classes)],
+                            yticklabels=[f"C{i}" for i in range(args.num_classes)])
+                plt.xlabel('Predicted')
+                plt.ylabel('True')
+                plt.title(f'Confusion Matrix - {experiment_name} - Fold {fold + 1} - Epoch {epoch + 1}')
+                plt.tight_layout()
+                plt.savefig(cm_path, dpi=300)
+                plt.close()
+
+            # Check for improvement
+            if val_metrics['f1'] > best_f1:
+                best_f1 = val_metrics['f1']
+                best_auc = val_metrics['auc']
+                best_accuracy = val_metrics['accuracy']
+
+                fold_model_path = os.path.join(exp_dir, f"best_model_fold_{fold + 1}.pth")
+                torch.save(model.state_dict(), fold_model_path)
+                print(f"Saved new best model for fold {fold + 1}, F1: {best_f1:.4f}, AUC: {best_auc:.4f}")
+                no_improve_epochs = 0
+            else:
+                no_improve_epochs += 1
+
+            # Early stopping
+            if no_improve_epochs >= args.early_stopping:
+                print(f"No improvement for {args.early_stopping} epochs. Early stopping.")
+                break
+
+        # Save fold history
+        with open(os.path.join(exp_dir, f'training_history_fold_{fold + 1}.json'), 'w') as f:
+            history_serializable = {}
+            for key, value in fold_history.items():
+                history_serializable[key] = [{k: float(v) if isinstance(v, (np.float32, np.float64)) else v
+                                              for k, v in epoch_metrics.items() if k != 'confusion_matrix'} for
+                                             epoch_metrics in value]
+            json.dump(history_serializable, f)
+
+        # Save fold results
+        cv_scores['f1'].append(best_f1)
+        cv_scores['auc'].append(best_auc)
+        cv_scores['accuracy'].append(best_accuracy)
+        fold_histories.append(fold_history)
+        fold_models.append(fold_model_path)
+
+        # Plot learning curves for this fold
+        plot_learning_curves(fold_history, exp_dir, f"{experiment_name}_fold_{fold + 1}")
+
+    # Calculate cross-validation statistics
+    mean_f1 = np.mean(cv_scores['f1'])
+    std_f1 = np.std(cv_scores['f1'])
+    mean_auc = np.mean(cv_scores['auc'])
+    std_auc = np.std(cv_scores['auc'])
+    mean_acc = np.mean(cv_scores['accuracy'])
+    std_acc = np.std(cv_scores['accuracy'])
+
+    print(f"\nCross-validation complete for {experiment_name}!")
+    print(f"Mean F1 score: {mean_f1:.4f} (±{std_f1:.4f})")
+    print(f"Mean AUC score: {mean_auc:.4f} (±{std_auc:.4f})")
+    print(f"Mean Accuracy: {mean_acc:.4f} (±{std_acc:.4f})")
+    print(f"Per-fold F1 scores: {cv_scores['f1']}")
+    print(f"Per-fold AUC scores: {cv_scores['auc']}")
+    print(f"Per-fold Accuracy scores: {cv_scores['accuracy']}")
+
+    # Save cross-validation results
+    cv_results = {
+        'mean_f1': float(mean_f1),
+        'std_f1': float(std_f1),
+        'mean_auc': float(mean_auc),
+        'std_auc': float(std_auc),
+        'mean_accuracy': float(mean_acc),
+        'std_accuracy': float(std_acc),
+        'fold_f1_scores': [float(score) for score in cv_scores['f1']],
+        'fold_auc_scores': [float(score) for score in cv_scores['auc']],
+        'fold_accuracy_scores': [float(score) for score in cv_scores['accuracy']],
+        'fold_models': fold_models,
+        'config': config,
         'args': vars(args)
     }
 
-    # Save confusion matrix separately
-    if 'confusion_matrix' in final_metrics:
-        plt.figure(figsize=(10, 8))
-        sns.heatmap(final_metrics['confusion_matrix'], annot=True, fmt='d', cmap='Blues',
-                    xticklabels=[f"C{i}" for i in range(args.num_classes)],
-                    yticklabels=[f"C{i}" for i in range(args.num_classes)])
-        plt.xlabel('Predicted')
-        plt.ylabel('True')
-        plt.title(f'Confusion Matrix - {experiment_name}')
-        plt.tight_layout()
-        plt.savefig(os.path.join(exp_dir, 'confusion_matrix.png'))
-        plt.close()
+    with open(os.path.join(exp_dir, 'cross_validation_results.json'), 'w') as f:
+        json.dump(cv_results, f, indent=4)
 
-    # Save learning curves
-    plot_learning_curves(history, exp_dir, experiment_name)
-
-    with open(os.path.join(exp_dir, 'results.json'), 'w') as f:
-        json.dump(results, f, indent=4)
-
-    print(f"\nExperiment {experiment_name} completed.")
-    print(f"Best F1 Score: {best_f1:.4f}")
-
-    return best_f1, final_metrics
+    return cv_results
 
 
 def plot_learning_curves(history, save_dir, experiment_name):
@@ -412,105 +452,146 @@ def plot_learning_curves(history, save_dir, experiment_name):
     plt.suptitle(f'Learning Curves - {experiment_name}')
     plt.tight_layout()
 
-    plt.savefig(os.path.join(save_dir, 'learning_curves.png'))
+    plt.savefig(os.path.join(save_dir, f'learning_curves_{experiment_name}.png'), dpi=300)
     plt.close()
 
 
-def create_summary_visualization(ablation_results, save_path='ablation_summary.png'):
-    """Create a summary visualization comparing all ablation experiments"""
+def create_summary_visualization(ablation_results, save_dir='ablation_results'):
+    """Create summary visualizations comparing all ablation experiments"""
     # Extract metrics for comparison
     experiment_names = []
     f1_scores = []
     accuracies = []
-    precisions = []
-    recalls = []
+    aucs = []
+
+    # Extract standard deviations for error bars
+    f1_stds = []
+    acc_stds = []
+    auc_stds = []
 
     for exp_name, result in ablation_results.items():
         experiment_names.append(exp_name)
-        metrics = result['final_metrics']
-        f1_scores.append(metrics['f1'])
-        accuracies.append(metrics['accuracy'])
-        precisions.append(metrics['precision'])
-        recalls.append(metrics['recall'])
+        f1_scores.append(result['mean_f1'])
+        accuracies.append(result['mean_accuracy'])
+        aucs.append(result['mean_auc'])
 
-    # Create figure with multiple comparisons
-    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+        # Extract standard deviations
+        f1_stds.append(result['std_f1'])
+        acc_stds.append(result['std_accuracy'])
+        auc_stds.append(result['std_auc'])
 
-    # Plot metrics
-    metrics_data = [f1_scores, accuracies, precisions, recalls]
-    metric_names = ['F1 Score', 'Accuracy', 'Precision', 'Recall']
-    colors = ['#2C7BB6', '#D7191C', '#FF7F00', '#33A02C']
+    # 1. Create bar charts for each metric with error bars
+    # Set aesthetic parameters
+    plt.figure(figsize=(15, 8))
+    bar_width = 0.25
+    index = np.arange(len(experiment_names))
 
-    for i, (ax, data, name, color) in enumerate(zip(axes.flatten(), metrics_data, metric_names, colors)):
-        # Sort experiments by performance for this metric
-        sorted_indices = np.argsort(data)
-        sorted_names = [experiment_names[j] for j in sorted_indices]
-        sorted_data = [data[j] for j in sorted_indices]
+    # Sort experiments by accuracy for consistent ordering
+    sorted_indices = np.argsort(accuracies)[::-1]  # Descending order
+    sorted_names = [experiment_names[i] for i in sorted_indices]
 
-        # Plot horizontal bars
-        bars = ax.barh(sorted_names, sorted_data, color=color, alpha=0.8)
-        ax.set_title(name, fontsize=14)
-        ax.set_xlim(min(0.5, min(data) * 0.95), max(1.0, max(data) * 1.05))
-        ax.grid(True, axis='x', alpha=0.3)
+    sorted_accuracies = [accuracies[i] for i in sorted_indices]
+    sorted_f1_scores = [f1_scores[i] for i in sorted_indices]
+    sorted_aucs = [aucs[i] for i in sorted_indices]
 
-        # Add value labels
-        for bar, value in zip(bars, sorted_data):
-            ax.text(value + 0.01, bar.get_y() + bar.get_height() / 2, f'{value:.4f}',
-                    va='center', fontsize=9)
+    sorted_acc_stds = [acc_stds[i] for i in sorted_indices]
+    sorted_f1_stds = [f1_stds[i] for i in sorted_indices]
+    sorted_auc_stds = [auc_stds[i] for i in sorted_indices]
 
-    plt.suptitle('Ablation Study Results', fontsize=16)
-    plt.tight_layout(rect=[0, 0, 1, 0.95])  # Make room for suptitle
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    # Create grouped bar chart
+    plt.figure(figsize=(14, 8))
+    bars1 = plt.bar(index, sorted_accuracies, bar_width, label='Accuracy', color='#3274A1',
+                    yerr=sorted_acc_stds, capsize=5)
+    bars2 = plt.bar(index + bar_width, sorted_f1_scores, bar_width, label='F1 Score', color='#E1812C',
+                    yerr=sorted_f1_stds, capsize=5)
+    bars3 = plt.bar(index + 2 * bar_width, sorted_aucs, bar_width, label='AUC', color='#3A923A',
+                    yerr=sorted_auc_stds, capsize=5)
+
+    plt.xlabel('Experiment', fontsize=12)
+    plt.ylabel('Score', fontsize=12)
+    plt.title('Performance Comparison Across Ablation Experiments', fontsize=16)
+    plt.xticks(index + bar_width, sorted_names, rotation=45, ha='right')
+    plt.legend()
+    plt.grid(True, axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+
+    # Add value labels
+    def add_labels(bars):
+        for bar in bars:
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width() / 2., height + 0.02,
+                     f'{height:.3f}', ha='center', va='bottom', fontsize=9)
+
+    add_labels(bars1)
+    add_labels(bars2)
+    add_labels(bars3)
+
+    plt.savefig(os.path.join(save_dir, 'metrics_comparison_bar.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
-    # Create a radar chart for multi-metric visualization
-    plt.figure(figsize=(10, 10))
+    # 2. Create radar chart for multi-metric visualization
+    # Prepare the data
+    labels = ['Accuracy', 'F1 Score', 'AUC']
+
+    # Number of variables
+    N = len(labels)
+
+    # Create angle for each variable
+    angles = [n / float(N) * 2 * np.pi for n in range(N)]
+    angles += angles[:1]  # Close the loop
+
+    # Set figure size
+    plt.figure(figsize=(12, 10))
+
+    # Create subplot with polar projection
     ax = plt.subplot(111, polar=True)
 
-    # Number of metrics
-    N = 4
-    angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
-    angles += angles[:1]  # Close the loop
+    # Set ticks and labels
+    plt.xticks(angles[:-1], labels, fontsize=12)
+
+    # Draw ylabels
+    ax.set_rlabel_position(0)
+    plt.yticks([0.2, 0.4, 0.6, 0.8, 1.0], ["0.2", "0.4", "0.6", "0.8", "1.0"], fontsize=10)
+    plt.ylim(0, 1)
 
     # Plot each experiment
     colors = plt.cm.viridis(np.linspace(0, 1, len(experiment_names)))
-    for i, exp_name in enumerate(experiment_names):
+    for i, name in enumerate(experiment_names):
         values = [
-            ablation_results[exp_name]['final_metrics']['f1'],
-            ablation_results[exp_name]['final_metrics']['accuracy'],
-            ablation_results[exp_name]['final_metrics']['precision'],
-            ablation_results[exp_name]['final_metrics']['recall']
+            ablation_results[name]['mean_accuracy'],
+            ablation_results[name]['mean_f1'],
+            ablation_results[name]['mean_auc']
         ]
         values += values[:1]  # Close the loop
 
-        ax.plot(angles, values, 'o-', linewidth=2, markersize=4, color=colors[i], label=exp_name)
-        ax.fill(angles, values, alpha=0.1, color=colors[i])
+        # Plot values
+        ax.plot(angles, values, linewidth=2, linestyle='solid', label=name, color=colors[i])
+        ax.fill(angles, values, alpha=0.25, color=colors[i])
 
-    # Set angle labels
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(['F1', 'Accuracy', 'Precision', 'Recall'])
+    # Add legend
+    plt.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1), fontsize=10)
 
-    # Add legend (place outside the plot for clarity)
-    plt.legend(loc='upper center', bbox_to_anchor=(0.5, -0.1), ncol=3)
+    plt.title('Ablation Study: Radar Plot of Metrics', fontsize=16, y=1.1)
 
-    plt.title('Multi-metric Comparison', fontsize=15)
     plt.tight_layout()
-    plt.savefig('ablation_radar_chart.png', dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(save_dir, 'metrics_radar_chart.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--acc_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/acc")
-    parser.add_argument('--sound_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/sound")
-    parser.add_argument('--temp_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/temp")
+    parser.add_argument('--acc_dir', type=str,
+                        default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/acc")
+    parser.add_argument('--sound_dir', type=str,
+                        default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/sound")
+    parser.add_argument('--temp_dir', type=str,
+                        default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/temp")
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--ablation_epochs', type=int, default=120)  # Fewer epochs for ablation
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--num_heads', type=int, default=8)
     parser.add_argument('--num_patches', type=int, default=48)
     parser.add_argument('--projection_dim', type=int, default=192)
-    parser.add_argument('--save_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/ablation_results")
+    parser.add_argument('--save_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/ablation_results2")
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--num_classes', type=int, default=10)
     parser.add_argument('--lr_scheduler', type=str, default='cosine_warmup')
@@ -525,60 +606,40 @@ def main():
     parser.add_argument('--dropout_rate', type=float, default=0.3)
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--epochs', type=int, default=120, help='Number of epochs to train')
-    parser.add_argument('--quick_ablation', action='store_true', help='Use subset of data for faster ablation')
-    parser.add_argument('--selected_experiments', type=str, default='all',
-                        help='Comma-separated list of experiment names to run, or "all" to run all experiments')
+    parser.add_argument('--early_stopping', type=int, default=20, help='Early stopping patience')
     args = parser.parse_args()
 
     # Create saving directory
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # Define all possible ablation experiments
-    all_ablation_configs = [
+    # Define the 8 required ablation experiments
+    ablation_configs = [
         {
-            'name': 'baseline',
-            'description': 'Full model with all components enabled'
-            # No ablations - all default settings
+            'name': 'entire_mechanism',
+            'description': 'Complete model with all components enabled'
+            # All features enabled by default
+        },
+        {
+            'name': 'no_PredictionModule',
+            'description': 'Model with equal weights for all modalities',
+            'disable_prediction_module': True
+        },
+        {
+            'name': 'no_CustomDataset',
+            'description': 'Model without data augmentation',
+            'disable_data_augmentation': True
         },
         {
             'name': 'no_cross_attention',
-            'description': 'Model without cross-attention between modalities',
+            'description': 'Model without cross-modal attention mechanism',
             'disable_cross_attention': True
         },
         {
-            'name': 'no_residual',
-            'description': 'Model without residual connections',
-            'disable_residual': True
-        },
-        {
-            'name': 'no_dynamic_weights',
-            'description': 'Model with equal weights for all modalities',
-            'disable_dynamic_weights': True
-        },
-        {
-            'name': 'no_multi_supervision',
-            'description': 'Model with only the main classifier',
-            'disable_multi_supervision': True
-        },
-        {
-            'name': 'fusion_concat',
-            'description': 'Simple concatenation fusion instead of transformer',
-            'fusion_method': 'concat'
-        },
-        {
-            'name': 'fusion_average',
-            'description': 'Simple averaging fusion instead of transformer',
-            'fusion_method': 'average'
-        },
-        {
-            'name': 'fusion_max',
-            'description': 'Simple max fusion instead of transformer',
-            'fusion_method': 'max'
-        },
-        {
-            'name': 'fusion_attention',
-            'description': 'Simple attention-based fusion',
-            'fusion_method': 'attention'
+            'name': 'baseline',
+            'description': 'Basic transformer fusion without prediction module, data augmentation, or cross-attention',
+            'disable_prediction_module': True,
+            'disable_cross_attention': True,
+            'disable_data_augmentation': True
         },
         {
             'name': 'only_acc',
@@ -594,56 +655,31 @@ def main():
             'name': 'only_temp',
             'description': 'Using only temperature modality',
             'use_only_modality': 'temp'
-        },
-        {
-            'name': 'minimal',
-            'description': 'Minimal model with most features disabled',
-            'disable_cross_attention': True,
-            'disable_residual': True,
-            'disable_dynamic_weights': True,
-            'disable_multi_supervision': True,
-            'fusion_method': 'average'
         }
     ]
 
-    # Filter experiments if specific ones are requested
-    if args.selected_experiments.lower() != 'all':
-        selected_names = [name.strip() for name in args.selected_experiments.split(',')]
-        ablation_configs = [config for config in all_ablation_configs if config['name'] in selected_names]
-        if not ablation_configs:
-            print(f"No valid experiment names found in: {args.selected_experiments}")
-            print(f"Available experiments: {[config['name'] for config in all_ablation_configs]}")
-            return
-        print(f"Running {len(ablation_configs)} selected experiments: {selected_names}")
-    else:
-        ablation_configs = all_ablation_configs
-        print(f"Running all {len(ablation_configs)} ablation experiments")
-
-    # Run each ablation experiment
-    results = {}
+    # Run each ablation experiment with cross-validation
+    cv_results = {}
     for config in ablation_configs:
-        best_f1, final_metrics = run_ablation_experiment(config, args, args.save_dir)
-        results[config['name']] = {
-            'best_f1': best_f1,
-            'final_metrics': {k: float(v) if isinstance(v, (np.float32, np.float64)) else v
-                              for k, v in final_metrics.items() if k != 'confusion_matrix'},
-            'config': config
-        }
+        result = run_ablation_experiment_with_cv(config, args, args.save_dir)
+        cv_results[config['name']] = result
 
     # Save overall results
-    with open(os.path.join(args.save_dir, 'all_results.json'), 'w') as f:
-        json.dump(results, f, indent=4)
+    with open(os.path.join(args.save_dir, 'all_cv_results.json'), 'w') as f:
+        json.dump(cv_results, f, indent=4)
 
     # Create summary visualizations
-    create_summary_visualization(results, os.path.join(args.save_dir, 'ablation_summary.png'))
+    create_summary_visualization(cv_results, args.save_dir)
 
     # Print final ranking by F1 score
     print("\n=== Ablation Study Results (Ranked by F1 Score) ===")
-    experiments_by_f1 = sorted(results.items(), key=lambda x: x[1]['best_f1'], reverse=True)
+    experiments_by_f1 = sorted(cv_results.items(), key=lambda x: x[1]['mean_f1'], reverse=True)
     for i, (exp_name, exp_result) in enumerate(experiments_by_f1):
-        print(f"{i + 1}. {exp_name}: F1={exp_result['best_f1']:.4f}")
+        print(f"{i + 1}. {exp_name}: F1={exp_result['mean_f1']:.4f}±{exp_result['std_f1']:.4f}, "
+              f"Accuracy={exp_result['mean_accuracy']:.4f}±{exp_result['std_accuracy']:.4f}, "
+              f"AUC={exp_result['mean_auc']:.4f}±{exp_result['std_auc']:.4f}")
 
-    print("\nAblation study completed! Results saved to", args.save_dir)
+    print("\nAblation study with cross-validation completed! Results saved to", args.save_dir)
 
 
 if __name__ == "__main__":
