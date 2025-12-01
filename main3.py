@@ -19,6 +19,14 @@ from tqdm import tqdm
 from visualization_utils import plot_cross_validation_summary
 from pathlib import Path
 
+# 尝试导入可视化工具（仅新增，不修改原结构）
+try:
+    from visualization_weights import compute_weights_for_loader, plot_weights_line_chart, plot_weights_mean_bars, plot_decision_level_fixed_weights
+    VISUALIZATION_AVAILABLE = True
+except Exception as _e:
+    VISUALIZATION_AVAILABLE = False
+    print(f"visualization_weights.py import failed (visualizations disabled): {_e}")
+
 
 # Set random seed for reproducibility
 def set_seed(seed=42):
@@ -570,6 +578,34 @@ def main():
 
             val_metrics = evaluate(model, val_loader, criterion, device, args.num_classes)
             fold_history['val'].append(val_metrics)
+
+            # ----- 新增（最小改动）：在每个验证 epoch 完成后尝试生成并保存三张权重可视化图片 -----
+            if VISUALIZATION_AVAILABLE:
+                try:
+                    # 1. 确保加载完整验证集数据
+                    # 将 max_batches 设置为 None
+                    print("Computing weights for full validation set for visualization...")
+                    weights_all, _ = compute_weights_for_loader(model, val_loader, device,
+                                                                max_batches=None)  # 修改点
+
+                    vis_dir = args.save_dir
+                    os.makedirs(vis_dir, exist_ok=True)
+
+                    # 2. 调用新的折线图函数
+                    line_chart_path = os.path.join(vis_dir,
+                                                   f"fold_{fold + 1}_epoch_{epoch + 1}_val_weights_line_chart.png")
+
+                    if weights_all is not None and weights_all.shape[0] > 0:
+                        # 确保样本数量是我们预期的820个左右
+                        print(f"Plotting line chart for {weights_all.shape[0]} samples.")
+                        plot_weights_line_chart(weights_all, save_path=line_chart_path,
+                                                title=f"Fold {fold + 1} Epoch {epoch + 1} - Modal Weights Trend ({weights_all.shape[0]} samples)")
+                    else:
+                        print("Visualization: no modal weights collected (empty).")
+
+                except Exception as e_vis:
+                    print(f"Warning: visualization failed at fold {fold + 1} epoch {epoch + 1}: {e_vis}")
+            # ----- 新增结束 -----
 
             if 'auc' in val_metrics and val_metrics['auc'] is not None:
                 print(
