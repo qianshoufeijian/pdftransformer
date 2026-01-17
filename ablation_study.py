@@ -14,30 +14,52 @@ from sklearn.metrics import roc_auc_score
 import copy
 
 from PDFtransformer import TransformerWithPDF, CustomDataset, EnhancedMixedLoss, get_enhanced_lr_scheduler
-from main import preprocess_data, train_with_mixed_precision, evaluate, set_seed, calculate_metrics
+from main3 import preprocess_data, train_with_mixed_precision, evaluate, set_seed, calculate_metrics
+
+# 导入增强版统计分析模块
+try:
+    from enhanced_ablation_analysis import run_enhanced_analysis
+
+    ENHANCED_ANALYSIS_AVAILABLE = True
+except ImportError:
+    ENHANCED_ANALYSIS_AVAILABLE = False
+    print("警告:  enhanced_ablation_analysis.py 未找到，将跳过增强统计分析")
 
 
 class AblationTransformerWithPDF(TransformerWithPDF):
+    """消融实验专用的Transformer模型，支持禁用特定组件"""
+
     def __init__(self, input_shape, num_heads, num_patches, projection_dim, num_classes,
                  image_input=False, dropout_rate=0.3,
-                 # Ablation parameters
                  disable_cross_attention=False,
                  disable_prediction_module=False,
-                 use_only_modality=None):  # None, 'acc', 'sound', 'temp'
+                 use_only_modality=None):
+        """
+        初始化消融实验模型
 
-        # Initialize parent class
+        参数:
+            input_shape:  输入形状
+            num_heads:  注意力头数
+            num_patches: patch数量
+            projection_dim: 投影维度
+            num_classes: 类别数
+            image_input: 是否使用图像输入
+            dropout_rate: dropout比率
+            disable_cross_attention: 是否禁用交叉注意力
+            disable_prediction_module: 是否禁用预测模块(动态权重)
+            use_only_modality: 仅使用单一模态 ('acc', 'sound', 'temp', None)
+        """
         super(AblationTransformerWithPDF, self).__init__(
             input_shape, num_heads, num_patches, projection_dim, num_classes,
             image_input, dropout_rate
         )
 
-        # Save ablation parameters
         self.disable_cross_attention = disable_cross_attention
         self.disable_prediction_module = disable_prediction_module
         self.use_only_modality = use_only_modality
 
     def forward(self, acc_data, sound_data, temp_data):
-        # Single modality mode
+        # 单模态模式：将其他模态置零
         if self.use_only_modality == 'acc':
             sound_data = torch.zeros_like(sound_data)
             temp_data = torch.zeros_like(temp_data)
@@ -48,22 +70,17 @@ class AblationTransformerWithPDF(TransformerWithPDF):
             acc_data = torch.zeros_like(acc_data)
             sound_data = torch.zeros_like(sound_data)
 
-        # Encode each modality
-        if self.image_input:
-            acc_patches = self.acc_encoder(acc_data)
-            sound_patches = self.sound_encoder(sound_data)
-            temp_patches = self.temp_encoder(temp_data)
-        else:
-            acc_patches = self.acc_encoder(acc_data)
-            sound_patches = self.sound_encoder(sound_data)
-            temp_patches = self.temp_encoder(temp_data)
+        # 编码各模态
+        acc_patches = self.acc_encoder(acc_data)
+        sound_patches = self.sound_encoder(sound_data)
+        temp_patches = self.temp_encoder(temp_data)
 
-        # Save original patches for residual connection
+        # 保存原始patches用于残差连接
         acc_original = acc_patches
         sound_original = sound_patches
         temp_original = temp_patches
 
-        # Apply modality-specific transformers with residual connections
+        # 应用模态特定的transformer层
         for layer in self.acc_transformer:
             acc_patches = layer(acc_patches)
             acc_patches = acc_patches + 0.1 * acc_original
@@ -76,73 +93,64 @@ class AblationTransformerWithPDF(TransformerWithPDF):
             temp_patches = layer(temp_patches)
             temp_patches = temp_patches + 0.1 * temp_original
 
-        # Calculate features for weight prediction and classification
+        # 计算特征用于权重预测和分类
         acc_feat = acc_patches.mean(dim=1)
         sound_feat = sound_patches.mean(dim=1)
         temp_feat = temp_patches.mean(dim=1)
 
-        # Modality-specific predictions for deep supervision
+        # 模态特定预测(深度监督)
         acc_pred = self.acc_classifier(acc_feat)
         sound_pred = self.sound_classifier(sound_feat)
         temp_pred = self.temp_classifier(temp_feat)
 
-        # Dynamic weight calculation (if enabled)
+        # 动态权重计算
         if not self.disable_prediction_module:
             acc_weights = self.acc_prediction_module(acc_feat)
             sound_weights = self.sound_prediction_module(sound_feat)
             temp_weights = self.temp_prediction_module(temp_feat)
 
-            # Weight normalization with softmax
             weights = torch.cat([acc_weights, sound_weights, temp_weights], dim=1)
             normalized_weights = torch.nn.functional.softmax(weights, dim=1)
             acc_weights = normalized_weights[:, 0].unsqueeze(1)
             sound_weights = normalized_weights[:, 1].unsqueeze(1)
             temp_weights = normalized_weights[:, 2].unsqueeze(1)
         else:
-            # Equal weights if disabled
+            # 禁用时使用等权重
             batch_size = acc_patches.size(0)
             acc_weights = torch.ones(batch_size, 1).to(acc_patches.device) / 3
             sound_weights = torch.ones(batch_size, 1).to(acc_patches.device) / 3
             temp_weights = torch.ones(batch_size, 1).to(acc_patches.device) / 3
 
-        # Apply fusion with or without cross-attention
+        # 融合(有无交叉注意力)
         if self.disable_cross_attention:
-            # When cross-attention is disabled, we concatenate the features directly
             fused_features = torch.cat([acc_patches, sound_patches, temp_patches], dim=1)
-            # Apply a simple linear layer to get back to original sequence length
             seq_len = acc_patches.size(1)
             fused_features = fused_features[:, :seq_len]
         else:
-            # Normal operation with cross-attention
             fused_features = self.fusion_layer(
                 acc_patches, sound_patches, temp_patches,
                 acc_weights, sound_weights, temp_weights
             )
 
-        # Main transformer processing
+        # 主transformer处理
         x = fused_features
         mid_features = None
-        secondary_features = None
 
         for i, layer in enumerate(self.transformer_layers):
             x = layer(x)
             if i == len(self.transformer_layers) // 2:
                 mid_features = x
-            elif i == len(self.transformer_layers) // 4:
-                secondary_features = x
 
-        # Intermediate classification (if available)
+        # 中间分类
         mid_logits = self.mid_classifier(mid_features[:, 0]) if mid_features is not None else \
             torch.zeros(x.size(0), self.fc_out[-1].out_features).to(x.device)
 
-        # Main classification from first token
+        # 主分类
         main_logits = self.fc_out(x[:, 0])
 
         if not self.training:
-            # During inference, just use main logits
             return main_logits
         else:
-            # Combine predictions with proper weights during training
             final_logits = (
                     main_logits * 0.6 +
                     mid_logits * 0.15 +
@@ -154,25 +162,36 @@ class AblationTransformerWithPDF(TransformerWithPDF):
 
 
 def run_ablation_experiment_with_cv(config, args, save_dir='ablation_results'):
-    """Run an ablation experiment with 5-fold cross-validation"""
-    experiment_name = config['name']
-    print(f"\n{'=' * 50}")
-    print(f"Running ablation experiment: {experiment_name}")
-    print(f"{'=' * 50}")
+    """
+    运行带5折交叉验证的消融实验
 
-    # Create directory to save results
+    参数:
+        config: 实验配置字典
+        args: 命令行参数
+        save_dir: 保存目录
+
+    返回:
+        交叉验证结果字典
+    """
+    experiment_name = config['name']
+    print(f"\n{'=' * 60}")
+    print(f"运行消融实验: {experiment_name}")
+    print(f"配置: {config}")
+    print(f"{'=' * 60}")
+
+    # 创建实验目录
     exp_dir = os.path.join(save_dir, experiment_name)
     os.makedirs(exp_dir, exist_ok=True)
 
-    # Set random seed
+    # 设置随机种子
     set_seed(args.seed)
 
-    # Device setup
+    # 设备设置
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"使用设备: {device}")
 
-    # Load and preprocess data
-    print("Loading data...")
+    # 加载数据
+    print("加载数据...")
     train_acc, train_sound, train_temp, train_labels = preprocess_data(
         os.path.join(args.acc_dir, "train"),
         os.path.join(args.sound_dir, "train"),
@@ -185,40 +204,41 @@ def run_ablation_experiment_with_cv(config, args, save_dir='ablation_results'):
         os.path.join(args.temp_dir, "val")
     )
 
-    # Combine datasets for cross-validation
+    # 合并数据集用于交叉验证
     all_acc = np.vstack((train_acc, val_acc))
     all_sound = np.vstack((train_sound, val_sound))
     all_temp = np.vstack((train_temp, val_temp))
     all_labels = np.concatenate((train_labels.reshape(-1), val_labels.reshape(-1)))
 
-    print(
-        f"Combined data shapes - Acceleration: {all_acc.shape}, Sound: {all_sound.shape}, Temperature: {all_temp.shape}")
-    print(f"Combined class distribution: {np.bincount(all_labels)}")
+    print(f"合并数据形状 - 加速度: {all_acc.shape}, 声音: {all_sound.shape}, 温度: {all_temp.shape}")
+    print(f"类别分布: {np.bincount(all_labels)}")
 
-    # Start 5-fold cross-validation
+    # 5折分层交叉验证
     kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=args.seed)
     cv_scores = {'accuracy': [], 'f1': [], 'auc': []}
     fold_histories = []
     fold_models = []
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(all_acc, all_labels)):
-        print(f"\n========== Fold {fold + 1}/5 ==========")
+        print(f"\n{'=' * 40}")
+        print(f"第 {fold + 1}/5 折")
+        print(f"{'=' * 40}")
 
-        # Split data for current fold
+        # 分割数据
         fold_train_acc, fold_val_acc = all_acc[train_idx], all_acc[val_idx]
         fold_train_sound, fold_val_sound = all_sound[train_idx], all_sound[val_idx]
         fold_train_temp, fold_val_temp = all_temp[train_idx], all_temp[val_idx]
         fold_train_labels, fold_val_labels = all_labels[train_idx], all_labels[val_idx]
 
-        print(f"Fold {fold + 1} split - Train: {len(fold_train_labels)}, Val: {len(fold_val_labels)}")
+        print(f"训练集:  {len(fold_train_labels)}, 验证集:  {len(fold_val_labels)}")
 
-        # For no_CustomDataset experiment, disable data augmentation
+        # 数据增强配置
         use_augmentation = not config.get('disable_data_augmentation', False)
 
         train_dataset = CustomDataset(
             fold_train_acc, fold_train_sound, fold_train_temp, fold_train_labels,
-            transform=use_augmentation,  # Only use augmentation if not disabled
-            aug_strength=0.5 if use_augmentation else 0.0,  # Set aug_strength to 0 if disabled
+            transform=use_augmentation,
+            aug_strength=0.5 if use_augmentation else 0.0,
             convert_to_image=args.use_image_input,
             image_size=(args.image_size, args.image_size)
         )
@@ -236,7 +256,7 @@ def run_ablation_experiment_with_cv(config, args, save_dir='ablation_results'):
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
                                 num_workers=0, pin_memory=True)
 
-        # Create model with ablation configuration
+        # 创建消融模型
         model = AblationTransformerWithPDF(
             input_shape=[fold_train_acc.shape[1], fold_train_sound.shape[1], fold_train_temp.shape[1]],
             num_heads=args.num_heads,
@@ -245,19 +265,17 @@ def run_ablation_experiment_with_cv(config, args, save_dir='ablation_results'):
             num_classes=args.num_classes,
             image_input=args.use_image_input,
             dropout_rate=args.dropout_rate,
-            # Ablation parameters from config
             disable_cross_attention=config.get('disable_cross_attention', False),
             disable_prediction_module=config.get('disable_prediction_module', False),
             use_only_modality=config.get('use_only_modality', None)
         ).to(device)
 
-        # Count trainable parameters
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Model has {num_params:,} trainable parameters")
+        print(f"模型参数量: {num_params:,}")
 
-        # Setup loss and optimizer
+        # 损失函数和优化器
         criterion = EnhancedMixedLoss(
-            alpha=None,  # No class weights for ablation studies to keep things simple
+            alpha=None,
             gamma=args.focal_gamma,
             smoothing=args.label_smoothing,
             temp=args.temp
@@ -271,7 +289,7 @@ def run_ablation_experiment_with_cv(config, args, save_dir='ablation_results'):
 
         scheduler = get_enhanced_lr_scheduler(optimizer, args, train_loader)
 
-        # Training loop
+        # 训练循环
         best_f1 = 0.0
         best_auc = 0.0
         best_accuracy = 0.0
@@ -279,19 +297,19 @@ def run_ablation_experiment_with_cv(config, args, save_dir='ablation_results'):
         fold_history = {'train': [], 'val': []}
 
         for epoch in range(args.epochs):
-            print(f"\nFold {fold + 1}, Epoch {epoch + 1}/{args.epochs}")
+            print(f"\n第 {fold + 1} 折, Epoch {epoch + 1}/{args.epochs}")
 
-            # Train
+            # 训练
             train_metrics = train_with_mixed_precision(
                 model, train_loader, optimizer, criterion, device,
                 epoch, args.epochs, scheduler, args.mixup_alpha, args.grad_clip
             )
             fold_history['train'].append(train_metrics)
 
-            # Validate
+            # 验证
             val_metrics = evaluate(model, val_loader, criterion, device, args.num_classes)
 
-            # Calculate AUC for multi-class classification (one-vs-rest)
+            # 计算AUC
             val_probs = []
             val_true = []
 
@@ -307,80 +325,82 @@ def run_ablation_experiment_with_cv(config, args, save_dir='ablation_results'):
             val_probs = np.vstack(val_probs)
             val_true = np.concatenate(val_true)
 
-            # Calculate one-vs-rest AUC for each class
+            # 计算多类AUC (one-vs-rest)
             auc_scores = []
             for i in range(args.num_classes):
-                if len(np.unique(val_true == i)) > 1:  # Only calculate AUC if both classes present
+                if len(np.unique(val_true == i)) > 1:
                     auc_scores.append(roc_auc_score((val_true == i).astype(int), val_probs[:, i]))
                 else:
                     auc_scores.append(0.0)
 
-            # Macro AUC (average across classes)
             val_metrics['auc'] = np.mean(auc_scores)
-
             fold_history['val'].append(val_metrics)
 
-            print(f"Train Loss: {train_metrics['loss']:.4f}, F1: {train_metrics['f1']:.4f}")
-            print(f"Val Loss: {val_metrics['loss']:.4f}, F1: {val_metrics['f1']:.4f}, AUC: {val_metrics['auc']:.4f}")
+            print(f"训练 Loss: {train_metrics['loss']:.4f}, F1: {train_metrics['f1']:.4f}")
+            print(f"验证 Loss: {val_metrics['loss']:.4f}, F1: {val_metrics['f1']:.4f}, AUC: {val_metrics['auc']:.4f}")
 
-            # Update scheduler if needed
-            if scheduler is not None and args.lr_scheduler == 'plateau':
-                scheduler.step(val_metrics['f1'])
-            elif scheduler is not None and not hasattr(scheduler, 'step_batch'):
-                scheduler.step()
+            # 更新学习率
+            if scheduler is not None:
+                if args.lr_scheduler == 'plateau':
+                    scheduler.step(val_metrics['f1'])
+                elif not hasattr(scheduler, 'step_batch'):
+                    scheduler.step()
 
-            # Save confusion matrix
+            # 保存混淆矩阵
             if 'confusion_matrix' in val_metrics:
                 cm_path = os.path.join(exp_dir, f"fold_{fold + 1}_cm_epoch_{epoch + 1}.png")
                 plt.figure(figsize=(10, 8))
                 sns.heatmap(val_metrics['confusion_matrix'], annot=True, fmt='d', cmap='Blues',
                             xticklabels=[f"C{i}" for i in range(args.num_classes)],
                             yticklabels=[f"C{i}" for i in range(args.num_classes)])
-                plt.xlabel('Predicted')
-                plt.ylabel('True')
-                plt.title(f'Confusion Matrix - {experiment_name} - Fold {fold + 1} - Epoch {epoch + 1}')
+                plt.xlabel('预测标签')
+                plt.ylabel('真实标签')
+                plt.title(f'混淆矩阵 - {experiment_name} - 第{fold + 1}折 - Epoch {epoch + 1}')
                 plt.tight_layout()
                 plt.savefig(cm_path, dpi=300)
                 plt.close()
 
-            # Check for improvement
+            # 检查是否有改进
             if val_metrics['f1'] > best_f1:
                 best_f1 = val_metrics['f1']
                 best_auc = val_metrics['auc']
                 best_accuracy = val_metrics['accuracy']
 
-                fold_model_path = os.path.join(exp_dir, f"best_model_fold_{fold + 1}.pth")
+                fold_model_path = os.path.join(exp_dir, f"best_model_fold_{fold + 1}. pth")
                 torch.save(model.state_dict(), fold_model_path)
-                print(f"Saved new best model for fold {fold + 1}, F1: {best_f1:.4f}, AUC: {best_auc:.4f}")
+                print(f"保存最佳模型:  F1={best_f1:.4f}, AUC={best_auc:.4f}")
                 no_improve_epochs = 0
             else:
                 no_improve_epochs += 1
 
-            # Early stopping
+            # 早停
             if no_improve_epochs >= args.early_stopping:
-                print(f"No improvement for {args.early_stopping} epochs. Early stopping.")
+                print(f"连续{args.early_stopping}个epoch无改进，早停")
                 break
 
-        # Save fold history
-        with open(os.path.join(exp_dir, f'training_history_fold_{fold + 1}.json'), 'w') as f:
-            history_serializable = {}
-            for key, value in fold_history.items():
-                history_serializable[key] = [{k: float(v) if isinstance(v, (np.float32, np.float64)) else v
-                                              for k, v in epoch_metrics.items() if k != 'confusion_matrix'} for
-                                             epoch_metrics in value]
-            json.dump(history_serializable, f)
+        # 保存本折训练历史
+        history_path = os.path.join(exp_dir, f'training_history_fold_{fold + 1}. json')
+        history_serializable = {}
+        for key, value in fold_history.items():
+            history_serializable[key] = [
+                {k: float(v) if isinstance(v, (np.float32, np.float64)) else v
+                 for k, v in epoch_metrics.items() if k != 'confusion_matrix'}
+                for epoch_metrics in value
+            ]
+        with open(history_path, 'w') as f:
+            json.dump(history_serializable, f, indent=2)
 
-        # Save fold results
+        # 记录本折结果
         cv_scores['f1'].append(best_f1)
         cv_scores['auc'].append(best_auc)
         cv_scores['accuracy'].append(best_accuracy)
         fold_histories.append(fold_history)
         fold_models.append(fold_model_path)
 
-        # Plot learning curves for this fold
+        # 绘制学习曲线
         plot_learning_curves(fold_history, exp_dir, f"{experiment_name}_fold_{fold + 1}")
 
-    # Calculate cross-validation statistics
+    # 计算交叉验证统计量
     mean_f1 = np.mean(cv_scores['f1'])
     std_f1 = np.std(cv_scores['f1'])
     mean_auc = np.mean(cv_scores['auc'])
@@ -388,16 +408,19 @@ def run_ablation_experiment_with_cv(config, args, save_dir='ablation_results'):
     mean_acc = np.mean(cv_scores['accuracy'])
     std_acc = np.std(cv_scores['accuracy'])
 
-    print(f"\nCross-validation complete for {experiment_name}!")
-    print(f"Mean F1 score: {mean_f1:.4f} (±{std_f1:.4f})")
-    print(f"Mean AUC score: {mean_auc:.4f} (±{std_auc:.4f})")
-    print(f"Mean Accuracy: {mean_acc:.4f} (±{std_acc:.4f})")
-    print(f"Per-fold F1 scores: {cv_scores['f1']}")
-    print(f"Per-fold AUC scores: {cv_scores['auc']}")
-    print(f"Per-fold Accuracy scores: {cv_scores['accuracy']}")
+    print(f"\n{'=' * 60}")
+    print(f"实验 {experiment_name} 交叉验证完成!")
+    print(f"{'=' * 60}")
+    print(f"平均 F1: {mean_f1:.4f} (±{std_f1:.4f})")
+    print(f"平均 AUC: {mean_auc:.4f} (±{std_auc:. 4f})")
+    print(f"平均准确率: {mean_acc:.4f} (±{std_acc:.4f})")
+    print(f"各折 F1: {[f'{s:.4f}' for s in cv_scores['f1']]}")
+    print(f"各折 AUC:  {[f'{s:.4f}' for s in cv_scores['auc']]}")
+    print(f"各折准确率: {[f'{s:.4f}' for s in cv_scores['accuracy']]}")
 
-    # Save cross-validation results
+    # 保存交叉验证结果
     cv_results = {
+        'experiment_name': experiment_name,
         'mean_f1': float(mean_f1),
         'std_f1': float(std_f1),
         'mean_auc': float(mean_auc),
@@ -412,59 +435,57 @@ def run_ablation_experiment_with_cv(config, args, save_dir='ablation_results'):
         'args': vars(args)
     }
 
-    with open(os.path.join(exp_dir, 'cross_validation_results.json'), 'w') as f:
+    results_path = os.path.join(exp_dir, 'cross_validation_results. json')
+    with open(results_path, 'w') as f:
         json.dump(cv_results, f, indent=4)
 
     return cv_results
 
 
 def plot_learning_curves(history, save_dir, experiment_name):
-    """Plot and save learning curves for the experiment"""
+    """绘制学习曲线"""
     plt.figure(figsize=(15, 5))
 
-    # Extract metrics
     epochs = range(1, len(history['train']) + 1)
     train_loss = [m['loss'] for m in history['train']]
     val_loss = [m['loss'] for m in history['val']]
     train_f1 = [m['f1'] for m in history['train']]
     val_f1 = [m['f1'] for m in history['val']]
 
-    # Loss subplot
+    # Loss曲线
     plt.subplot(1, 2, 1)
-    plt.plot(epochs, train_loss, 'b-', label='Training Loss')
-    plt.plot(epochs, val_loss, 'r-', label='Validation Loss')
-    plt.title('Loss')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.legend()
+    plt.plot(epochs, train_loss, 'b-', label='训练Loss', linewidth=2)
+    plt.plot(epochs, val_loss, 'r-', label='验证Loss', linewidth=2)
+    plt.title('损失曲线', fontsize=14)
+    plt.xlabel('Epochs', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.legend(fontsize=10)
     plt.grid(True, alpha=0.3)
 
-    # F1 subplot
+    # F1曲线
     plt.subplot(1, 2, 2)
-    plt.plot(epochs, train_f1, 'b-', label='Training F1')
-    plt.plot(epochs, val_f1, 'r-', label='Validation F1')
-    plt.title('F1 Score')
-    plt.xlabel('Epochs')
-    plt.ylabel('F1')
-    plt.legend()
+    plt.plot(epochs, train_f1, 'b-', label='训练F1', linewidth=2)
+    plt.plot(epochs, val_f1, 'r-', label='验证F1', linewidth=2)
+    plt.title('F1分数曲线', fontsize=14)
+    plt.xlabel('Epochs', fontsize=12)
+    plt.ylabel('F1', fontsize=12)
+    plt.legend(fontsize=10)
     plt.grid(True, alpha=0.3)
 
-    plt.suptitle(f'Learning Curves - {experiment_name}')
+    plt.suptitle(f'学习曲线 - {experiment_name}', fontsize=16)
     plt.tight_layout()
 
-    plt.savefig(os.path.join(save_dir, f'learning_curves_{experiment_name}.png'), dpi=300)
+    save_path = os.path.join(save_dir, f'learning_curves_{experiment_name}.png')
+    plt.savefig(save_path, dpi=300)
     plt.close()
 
 
 def create_summary_visualization(ablation_results, save_dir='ablation_results'):
-    """Create summary visualizations comparing all ablation experiments"""
-    # Extract metrics for comparison
+    """创建消融实验汇总可视化"""
     experiment_names = []
     f1_scores = []
     accuracies = []
     aucs = []
-
-    # Extract standard deviations for error bars
     f1_stds = []
     acc_stds = []
     auc_stds = []
@@ -474,48 +495,41 @@ def create_summary_visualization(ablation_results, save_dir='ablation_results'):
         f1_scores.append(result['mean_f1'])
         accuracies.append(result['mean_accuracy'])
         aucs.append(result['mean_auc'])
-
-        # Extract standard deviations
         f1_stds.append(result['std_f1'])
         acc_stds.append(result['std_accuracy'])
         auc_stds.append(result['std_auc'])
 
-    # 1. Create bar charts for each metric with error bars
-    # Set aesthetic parameters
-    plt.figure(figsize=(15, 8))
-    bar_width = 0.25
-    index = np.arange(len(experiment_names))
-
-    # Sort experiments by accuracy for consistent ordering
-    sorted_indices = np.argsort(accuracies)[::-1]  # Descending order
+    # 按准确率排序
+    sorted_indices = np.argsort(accuracies)[::-1]
     sorted_names = [experiment_names[i] for i in sorted_indices]
-
     sorted_accuracies = [accuracies[i] for i in sorted_indices]
     sorted_f1_scores = [f1_scores[i] for i in sorted_indices]
     sorted_aucs = [aucs[i] for i in sorted_indices]
-
     sorted_acc_stds = [acc_stds[i] for i in sorted_indices]
     sorted_f1_stds = [f1_stds[i] for i in sorted_indices]
     sorted_auc_stds = [auc_stds[i] for i in sorted_indices]
 
-    # Create grouped bar chart
-    plt.figure(figsize=(14, 8))
-    bars1 = plt.bar(index, sorted_accuracies, bar_width, label='Accuracy', color='#3274A1',
-                    yerr=sorted_acc_stds, capsize=5)
-    bars2 = plt.bar(index + bar_width, sorted_f1_scores, bar_width, label='F1 Score', color='#E1812C',
-                    yerr=sorted_f1_stds, capsize=5)
-    bars3 = plt.bar(index + 2 * bar_width, sorted_aucs, bar_width, label='AUC', color='#3A923A',
-                    yerr=sorted_auc_stds, capsize=5)
+    # 创建分组柱状图
+    plt.figure(figsize=(16, 8))
+    bar_width = 0.25
+    index = np.arange(len(sorted_names))
 
-    plt.xlabel('Experiment', fontsize=12)
-    plt.ylabel('Score', fontsize=12)
-    plt.title('Performance Comparison Across Ablation Experiments', fontsize=16)
-    plt.xticks(index + bar_width, sorted_names, rotation=45, ha='right')
-    plt.legend()
+    bars1 = plt.bar(index, sorted_accuracies, bar_width, label='准确率', color='#3274A1',
+                    yerr=sorted_acc_stds, capsize=5, edgecolor='black', linewidth=1)
+    bars2 = plt.bar(index + bar_width, sorted_f1_scores, bar_width, label='F1分数', color='#E1812C',
+                    yerr=sorted_f1_stds, capsize=5, edgecolor='black', linewidth=1)
+    bars3 = plt.bar(index + 2 * bar_width, sorted_aucs, bar_width, label='AUC', color='#3A923A',
+                    yerr=sorted_auc_stds, capsize=5, edgecolor='black', linewidth=1)
+
+    plt.xlabel('实验配置', fontsize=14)
+    plt.ylabel('分数', fontsize=14)
+    plt.title('消融实验性能对比 (含标准差误差条)', fontsize=16, fontweight='bold')
+    plt.xticks(index + bar_width, sorted_names, rotation=45, ha='right', fontsize=11)
+    plt.legend(fontsize=12, loc='lower right')
     plt.grid(True, axis='y', linestyle='--', alpha=0.7)
     plt.tight_layout()
 
-    # Add value labels
+    # 添加数值标签
     def add_labels(bars):
         for bar in bars:
             height = bar.get_height()
@@ -526,35 +540,24 @@ def create_summary_visualization(ablation_results, save_dir='ablation_results'):
     add_labels(bars2)
     add_labels(bars3)
 
-    plt.savefig(os.path.join(save_dir, 'metrics_comparison_bar.png'), dpi=300, bbox_inches='tight')
+    save_path = os.path.join(save_dir, 'metrics_comparison_bar.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
+    print(f"性能对比柱状图已保存至:  {save_path}")
 
-    # 2. Create radar chart for multi-metric visualization
-    # Prepare the data
-    labels = ['Accuracy', 'F1 Score', 'AUC']
-
-    # Number of variables
+    # 创建雷达图
+    labels = ['准确率', 'F1分数', 'AUC']
     N = len(labels)
-
-    # Create angle for each variable
     angles = [n / float(N) * 2 * np.pi for n in range(N)]
-    angles += angles[:1]  # Close the loop
+    angles += angles[:1]
 
-    # Set figure size
     plt.figure(figsize=(12, 10))
-
-    # Create subplot with polar projection
     ax = plt.subplot(111, polar=True)
-
-    # Set ticks and labels
     plt.xticks(angles[:-1], labels, fontsize=12)
-
-    # Draw ylabels
     ax.set_rlabel_position(0)
     plt.yticks([0.2, 0.4, 0.6, 0.8, 1.0], ["0.2", "0.4", "0.6", "0.8", "1.0"], fontsize=10)
     plt.ylim(0, 1)
 
-    # Plot each experiment
     colors = plt.cm.viridis(np.linspace(0, 1, len(experiment_names)))
     for i, name in enumerate(experiment_names):
         values = [
@@ -562,124 +565,180 @@ def create_summary_visualization(ablation_results, save_dir='ablation_results'):
             ablation_results[name]['mean_f1'],
             ablation_results[name]['mean_auc']
         ]
-        values += values[:1]  # Close the loop
-
-        # Plot values
+        values += values[:1]
         ax.plot(angles, values, linewidth=2, linestyle='solid', label=name, color=colors[i])
-        ax.fill(angles, values, alpha=0.25, color=colors[i])
+        ax.fill(angles, values, alpha=0.2, color=colors[i])
 
-    # Add legend
-    plt.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1), fontsize=10)
-
-    plt.title('Ablation Study: Radar Plot of Metrics', fontsize=16, y=1.1)
-
+    plt.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=10)
+    plt.title('消融实验:  多指标雷达图', fontsize=16, y=1.1, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'metrics_radar_chart.png'), dpi=300, bbox_inches='tight')
+
+    radar_path = os.path.join(save_dir, 'metrics_radar_chart.png')
+    plt.savefig(radar_path, dpi=300, bbox_inches='tight')
     plt.close()
+    print(f"雷达图已保存至: {radar_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    """主函数"""
+    parser = argparse.ArgumentParser(description='PDFTransformer消融实验')
+
+    # 数据路径
     parser.add_argument('--acc_dir', type=str,
                         default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/acc")
     parser.add_argument('--sound_dir', type=str,
                         default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/sound")
     parser.add_argument('--temp_dir', type=str,
                         default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/temp")
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--lr', type=float, default=3e-4)
+
+    # 训练参数
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--epochs', type=int, default=150)
+    parser.add_argument('--early_stopping', type=int, default=70)
+
+    # 模型参数
     parser.add_argument('--num_heads', type=int, default=8)
-    parser.add_argument('--num_patches', type=int, default=48)
-    parser.add_argument('--projection_dim', type=int, default=192)
-    parser.add_argument('--save_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/ablation_results2")
-    parser.add_argument('--device', type=str, default='cuda:0')
-    parser.add_argument('--num_classes', type=int, default=10)
+    parser.add_argument('--num_patches', type=int, default=64)
+    parser.add_argument('--projection_dim', type=int, default=128)
+    parser.add_argument('--num_classes', type=int, default=8)
+    parser.add_argument('--dropout_rate', type=float, default=0.4)
+
+    # 训练技巧
     parser.add_argument('--lr_scheduler', type=str, default='cosine_warmup')
-    parser.add_argument('--focal_gamma', type=float, default=2.0)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--mixup_alpha', type=float, default=0.3)
-    parser.add_argument('--label_smoothing', type=float, default=0.1)
+    parser.add_argument('--focal_gamma', type=float, default=2.5)
+    parser.add_argument('--mixup_alpha', type=float, default=0.4)
+    parser.add_argument('--label_smoothing', type=float, default=0.15)
     parser.add_argument('--temp', type=float, default=1.0)
     parser.add_argument('--weight_decay', type=float, default=2e-5)
-    parser.add_argument('--use_image_input', action='store_true', help='Convert modality data to images')
-    parser.add_argument('--image_size', type=int, default=224)
-    parser.add_argument('--dropout_rate', type=float, default=0.3)
     parser.add_argument('--grad_clip', type=float, default=1.0)
-    parser.add_argument('--epochs', type=int, default=120, help='Number of epochs to train')
-    parser.add_argument('--early_stopping', type=int, default=20, help='Early stopping patience')
+
+    # 其他参数
+    parser.add_argument('--save_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/ablation_results6")
+    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--use_image_input', action='store_true')
+    parser.add_argument('--image_size', type=int, default=224)
+
+    # 统计分析参数
+    parser.add_argument('--run_statistical_analysis', action='store_true', default=True,
+                        help='是否运行增强版统计分析')
+
     args = parser.parse_args()
 
-    # Create saving directory
+    # 创建保存目录
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # Define the 8 required ablation experiments
+    # 保存实验配置
+    config_path = os.path.join(args.save_dir, 'experiment_config.json')
+    with open(config_path, 'w') as f:
+        json.dump(vars(args), f, indent=4)
+    print(f"实验配置已保存至: {config_path}")
+
+    # 定义8个消融实验配置
     ablation_configs = [
         {
             'name': 'entire_mechanism',
-            'description': 'Complete model with all components enabled'
-            # All features enabled by default
+            'description': '完整模型(所有组件启用)'
         },
         {
             'name': 'no_PredictionModule',
-            'description': 'Model with equal weights for all modalities',
+            'description': '禁用动态权重预测模块(使用等权重)',
             'disable_prediction_module': True
         },
         {
             'name': 'no_CustomDataset',
-            'description': 'Model without data augmentation',
+            'description': '禁用数据增强',
             'disable_data_augmentation': True
         },
         {
             'name': 'no_cross_attention',
-            'description': 'Model without cross-modal attention mechanism',
+            'description': '禁用跨模态注意力机制',
             'disable_cross_attention': True
         },
         {
             'name': 'baseline',
-            'description': 'Basic transformer fusion without prediction module, data augmentation, or cross-attention',
+            'description': '基线模型(禁用所有增强组件)',
             'disable_prediction_module': True,
             'disable_cross_attention': True,
             'disable_data_augmentation': True
         },
         {
             'name': 'only_acc',
-            'description': 'Using only acceleration modality',
+            'description': '仅使用加速度模态',
             'use_only_modality': 'acc'
         },
         {
             'name': 'only_sound',
-            'description': 'Using only sound modality',
+            'description': '仅使用声音模态',
             'use_only_modality': 'sound'
         },
         {
             'name': 'only_temp',
-            'description': 'Using only temperature modality',
+            'description': '仅使用温度模态',
             'use_only_modality': 'temp'
         }
     ]
 
-    # Run each ablation experiment with cross-validation
+    print("\n" + "=" * 70)
+    print("                    PDFTransformer 消融实验")
+    print("=" * 70)
+    print(f"共 {len(ablation_configs)} 个实验配置，每个使用5折交叉验证")
+    print("=" * 70 + "\n")
+
+    # 运行所有消融实验
     cv_results = {}
-    for config in ablation_configs:
+    for i, config in enumerate(ablation_configs):
+        print(f"\n>>> 实验 {i + 1}/{len(ablation_configs)}: {config['name']} <<<")
         result = run_ablation_experiment_with_cv(config, args, args.save_dir)
         cv_results[config['name']] = result
 
-    # Save overall results
-    with open(os.path.join(args.save_dir, 'all_cv_results.json'), 'w') as f:
+    # 保存所有结果
+    all_results_path = os.path.join(args.save_dir, 'all_cv_results.json')
+    with open(all_results_path, 'w') as f:
         json.dump(cv_results, f, indent=4)
+    print(f"\n所有交叉验证结果已保存至: {all_results_path}")
 
-    # Create summary visualizations
+    # 创建基础可视化
     create_summary_visualization(cv_results, args.save_dir)
 
-    # Print final ranking by F1 score
-    print("\n=== Ablation Study Results (Ranked by F1 Score) ===")
-    experiments_by_f1 = sorted(cv_results.items(), key=lambda x: x[1]['mean_f1'], reverse=True)
-    for i, (exp_name, exp_result) in enumerate(experiments_by_f1):
-        print(f"{i + 1}. {exp_name}: F1={exp_result['mean_f1']:.4f}±{exp_result['std_f1']:.4f}, "
-              f"Accuracy={exp_result['mean_accuracy']:.4f}±{exp_result['std_accuracy']:.4f}, "
-              f"AUC={exp_result['mean_auc']:.4f}±{exp_result['std_auc']:.4f}")
+    # 运行增强版统计分析
+    if args.run_statistical_analysis and ENHANCED_ANALYSIS_AVAILABLE:
+        print("\n" + "=" * 70)
+        print("                运行增强版统计分析")
+        print("=" * 70)
 
-    print("\nAblation study with cross-validation completed! Results saved to", args.save_dir)
+        statistical_save_dir = os.path.join(args.save_dir, 'statistical_analysis')
+        try:
+            report = run_enhanced_analysis(all_results_path, statistical_save_dir)
+            print(f"\n统计分析结果已保存至: {statistical_save_dir}")
+        except Exception as e:
+            print(f"统计分析时出错: {e}")
+            import traceback
+            traceback.print_exc()
+    elif not ENHANCED_ANALYSIS_AVAILABLE:
+        print("\n警告:  enhanced_ablation_analysis. py 不可用，跳过增强统计分析")
+        print("请确保 enhanced_ablation_analysis.py 在同一目录下")
+
+    # 打印最终排名
+    print("\n" + "=" * 70)
+    print("              消融实验最终结果 (按F1分数排序)")
+    print("=" * 70)
+
+    experiments_by_f1 = sorted(cv_results.items(), key=lambda x: x[1]['mean_f1'], reverse=True)
+
+    print(f"\n{'排名':<4} {'实验名称':<25} {'F1分数':<20} {'准确率':<20} {'AUC':<20}")
+    print("-" * 89)
+
+    for i, (exp_name, exp_result) in enumerate(experiments_by_f1):
+        f1_str = f"{exp_result['mean_f1']:.4f}±{exp_result['std_f1']:.4f}"
+        acc_str = f"{exp_result['mean_accuracy']:.4f}±{exp_result['std_accuracy']:. 4f}"
+        auc_str = f"{exp_result['mean_auc']:.4f}±{exp_result['std_auc']:.4f}"
+        print(f"{i + 1:<4} {exp_name: <25} {f1_str:<20} {acc_str: <20} {auc_str:<20}")
+
+    print("\n" + "=" * 70)
+    print(f"消融实验完成!  所有结果保存于: {args.save_dir}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
