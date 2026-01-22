@@ -11,17 +11,21 @@ import os
 import json
 from PDFtransformer import TransformerWithPDF, CustomDataset, EnhancedMixedLoss, get_enhanced_lr_scheduler, \
     balance_dataset, plot_confusion_matrix
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler  # Use new AMP API
 from sklearn.model_selection import StratifiedKFold
 import inspect
 import random
 from tqdm import tqdm
 from visualization_utils import plot_cross_validation_summary
 from pathlib import Path
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # 尝试导入可视化工具（仅新增，不修改原结构）
 try:
-    from visualization_weights import compute_weights_for_loader, plot_weights_line_chart, plot_weights_mean_bars, plot_decision_level_fixed_weights
+    from visualization_weights import compute_weights_for_loader, plot_weights_line_chart, plot_weights_mean_bars, \
+        plot_decision_level_fixed_weights
+
     VISUALIZATION_AVAILABLE = True
 except Exception as _e:
     VISUALIZATION_AVAILABLE = False
@@ -94,6 +98,53 @@ def balance_dataset(acc_data, sound_data, temp_data, labels, sampling_strategy='
     return balanced_acc, balanced_sound, balanced_temp, resampled_labels
 
 
+# New function to plot cross-modal attention
+def plot_cross_attention(attention_weights, save_path, epoch, fold):
+    """
+    Visualizes the cross-modal attention weights.
+    Averages weights across the batch and heads for simplicity.
+    """
+    if not attention_weights:
+        print("No attention weights found to plot.")
+        return
+
+    # Determine the grid size for subplots
+    num_plots = len(attention_weights)
+    if num_plots == 0: return
+
+    # Try to make a square-ish grid
+    cols = int(np.ceil(np.sqrt(num_plots)))
+    rows = int(np.ceil(num_plots / cols))
+
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 6, rows * 5))
+    axes = axes.flatten()
+
+    fig.suptitle(f'Cross-Modal Attention - Fold {fold}, Epoch {epoch}', fontsize=16)
+
+    for i, (key, value) in enumerate(attention_weights.items()):
+        # key is e.g., 'acc_sound', value is the attention tensor
+        # value shape: [batch_size, query_len, key_len] after head avg
+
+        # Average across batch
+        avg_attn = value.mean(dim=0).cpu().numpy()
+
+        query_modality, key_modality = key.split('_')
+
+        sns.heatmap(avg_attn, ax=axes[i], cmap='viridis')
+        axes[i].set_title(f'Query: {query_modality.upper()} -> Key: {key_modality.upper()}')
+        axes[i].set_xlabel(f'{key_modality.upper()} Patches (+CLS)')
+        axes[i].set_ylabel(f'{query_modality.upper()} Patches (+CLS)')
+
+    # Hide any unused subplots
+    for j in range(i + 1, len(axes)):
+        axes[j].axis('off')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(save_path)
+    plt.close(fig)
+    print(f"Saved cross-attention visualization to {save_path}")
+
+
 # Improved training function with mixed precision and dynamic mixup
 def train_with_mixed_precision(model, train_loader, optimizer, criterion, device, epoch, epochs, scheduler=None,
                                mixup_alpha=0.4, grad_clip_value=1.0):
@@ -102,8 +153,8 @@ def train_with_mixed_precision(model, train_loader, optimizer, criterion, device
     all_preds = []
     all_labels = []
 
-    # 更新为新API
-    scaler = torch.amp.GradScaler('cuda')
+    # Use new AMP API
+    scaler = GradScaler() if device.type == 'cuda' else None
 
     # Progress bar with tqdm
     pbar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{epochs}')
@@ -123,8 +174,8 @@ def train_with_mixed_precision(model, train_loader, optimizer, criterion, device
             mixed_sound = lam * sound_data + (1 - lam) * sound_data[idx]
             mixed_temp = lam * temp_data + (1 - lam) * temp_data[idx]
 
-            # 更新为新API
-            with torch.amp.autocast('cuda', dtype=torch.float16):
+            # Use new AMP API
+            with autocast(device_type=device.type, enabled=(scaler is not None)):
                 outputs = model(mixed_acc, mixed_sound, mixed_temp)
                 squeezed_labels = labels.squeeze()
                 squeezed_idx_labels = labels[idx].squeeze()
@@ -132,18 +183,23 @@ def train_with_mixed_precision(model, train_loader, optimizer, criterion, device
                 loss2 = criterion(outputs, squeezed_idx_labels)
                 loss = lam * loss1 + (1 - lam) * loss2
         else:
-            # 更新为新API
-            with torch.amp.autocast('cuda', dtype=torch.float16):
+            # Use new AMP API
+            with autocast(device_type=device.type, enabled=(scaler is not None)):
                 outputs = model(acc_data, sound_data, temp_data)
                 labels = labels.squeeze()
                 loss = criterion(outputs, labels)
 
         optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_value)
-        scaler.step(optimizer)
-        scaler.update()
+        if scaler:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_value)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_value)
+            optimizer.step()
 
         running_loss += loss.item()
 
@@ -320,7 +376,11 @@ def calculate_metrics(true_labels, pred_labels, probs=None, num_classes=None):
     }
     if probs is not None and num_classes is not None:
         try:
-            metrics['auc'] = roc_auc_score(true_labels, probs, multi_class='ovr')
+            # Ensure there are samples from more than one class for AUC calculation
+            if len(np.unique(true_labels)) > 1:
+                metrics['auc'] = roc_auc_score(true_labels, probs, multi_class='ovr')
+            else:
+                metrics['auc'] = None
         except Exception:
             metrics['auc'] = None
     return metrics
@@ -363,7 +423,10 @@ def enhanced_ensemble_predict(model_paths, acc_data, sound_data, temp_data, devi
 
     # 按置信度加权模型
     total_confidence = sum(all_confidences)
-    weights = np.array([conf / total_confidence for conf in all_confidences])
+    if total_confidence > 0:
+        weights = np.array([conf / total_confidence for conf in all_confidences])
+    else:
+        weights = np.ones(len(all_confidences)) / len(all_confidences)
 
     # 计算加权平均概率
     avg_probs = np.zeros_like(all_probs[0])
@@ -382,12 +445,12 @@ def main():
                         default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/sound")
     parser.add_argument('--temp_dir', type=str,
                         default="D:/PyCharm/Project_PDFtransformer/University of Ottawa Electric Motor Dataset/temp")
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--epochs', type=int, default=120)
-    parser.add_argument('--lr', type=float, default=3e-4)
-    parser.add_argument('--num_heads', type=int, default=8)
-    parser.add_argument('--num_patches', type=int, default=48)
-    parser.add_argument('--projection_dim', type=int, default=192)
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--epochs', type=int, default=150)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--num_heads', type=int, default=4)
+    parser.add_argument('--num_patches', type=int, default=64)
+    parser.add_argument('--projection_dim', type=int, default=128)
     parser.add_argument('--save_dir', type=str, default="D:/PyCharm/Project_PDFtransformer/saved6")
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--num_classes', type=int, default=8
@@ -395,18 +458,18 @@ def main():
     parser.add_argument('--balance_data', action='store_true', help='Apply data balancing')
     parser.add_argument('--lr_scheduler', type=str, default='cosine_warmup',
                         choices=['step', 'cosine', 'cosine_warm', 'one_cycle', 'plateau', 'cosine_warmup', 'cyclic'])
-    parser.add_argument('--focal_gamma', type=float, default=2.0)
+    parser.add_argument('--focal_gamma', type=float, default=2.5)
     parser.add_argument('--early_stopping', type=int, default=20)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--aug_strength_start', type=float, default=0.85)
+    parser.add_argument('--aug_strength_start', type=float, default=0.9)
     parser.add_argument('--aug_strength_end', type=float, default=0.4)
-    parser.add_argument('--mixup_alpha', type=float, default=0.3)
-    parser.add_argument('--label_smoothing', type=float, default=0.1)
+    parser.add_argument('--mixup_alpha', type=float, default=0.4)
+    parser.add_argument('--label_smoothing', type=float, default=0.15)
     parser.add_argument('--temp', type=float, default=1.0)
     parser.add_argument('--weight_decay', type=float, default=2e-5)
     parser.add_argument('--use_image_input', action='store_true', help='Convert modality data to images')
     parser.add_argument('--image_size', type=int, default=224)
-    parser.add_argument('--dropout_rate', type=float, default=0.3)
+    parser.add_argument('--dropout_rate', type=float, default=0.4)
     parser.add_argument('--grad_clip', type=float, default=1.0)
     args = parser.parse_args()
 
@@ -418,6 +481,9 @@ def main():
 
     # Create saving directory
     os.makedirs(args.save_dir, exist_ok=True)
+    # Create visualization directory
+    vis_dir = os.path.join(args.save_dir, 'visualizations')
+    os.makedirs(vis_dir, exist_ok=True)
 
     # Device setup
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -579,6 +645,16 @@ def main():
             val_metrics = evaluate(model, val_loader, criterion, device, args.num_classes)
             fold_history['val'].append(val_metrics)
 
+            # ----- 新增：在每个验证 epoch 完成后生成并保存交叉注意力可视化 -----
+            try:
+                # The attention weights are automatically captured in model.attention_weights during eval
+                if model.attention_weights:
+                    attn_save_path = os.path.join(vis_dir, f"fold_{fold + 1}_epoch_{epoch + 1}_cross_attention.png")
+                    plot_cross_attention(model.attention_weights, attn_save_path, epoch + 1, fold + 1)
+            except Exception as e_vis:
+                print(f"Warning: cross-attention visualization failed at fold {fold + 1} epoch {epoch + 1}: {e_vis}")
+            # ----- 新增结束 -----
+
             # ----- 新增（最小改动）：在每个验证 epoch 完成后尝试生成并保存三张权重可视化图片 -----
             if VISUALIZATION_AVAILABLE:
                 try:
@@ -588,7 +664,6 @@ def main():
                     weights_all, _ = compute_weights_for_loader(model, val_loader, device,
                                                                 max_batches=None)  # 修改点
 
-                    vis_dir = args.save_dir
                     os.makedirs(vis_dir, exist_ok=True)
 
                     # 2. 调用新的折线图函数
@@ -684,10 +759,6 @@ def main():
 
     with open(os.path.join(args.save_dir, 'cross_validation_results.json'), 'w') as f:
         json.dump(cv_results, f, indent=4)
-
-    # Create visualization directory
-    vis_dir = os.path.join(args.save_dir, 'visualizations')
-    os.makedirs(vis_dir, exist_ok=True)
 
     # Only create the cross-validation summary visualization
     plot_cross_validation_summary(cv_results, vis_dir)
